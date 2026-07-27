@@ -258,8 +258,13 @@ def explain_failure(record):
     return f"{reason_text} → message was {outcome}."
 
 
+REPORTS_PER_PAGE = 50
+
+
 @app.route("/")
 def index():
+    page = max(1, request.args.get("page", 1, type=int))
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -277,6 +282,9 @@ def index():
             )
             summary = cur.fetchone()
 
+            total_pages = max(1, math.ceil(summary["total_reports"] / REPORTS_PER_PAGE))
+            page = min(page, total_pages)
+
             cur.execute(
                 """
                 SELECT
@@ -292,8 +300,9 @@ def index():
                 LEFT JOIN dmarc.aggregate_records rec ON rec.report_id = ar.id
                 GROUP BY ar.id
                 ORDER BY ar.date_begin DESC
-                LIMIT 100
-                """
+                LIMIT %s OFFSET %s
+                """,
+                (REPORTS_PER_PAGE, (page - 1) * REPORTS_PER_PAGE),
             )
             reports = cur.fetchall()
     finally:
@@ -305,6 +314,8 @@ def index():
         domain_status=domain_status,
         summary=summary,
         reports=reports,
+        page=page,
+        total_pages=total_pages,
     )
 
 
