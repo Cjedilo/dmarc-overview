@@ -34,6 +34,10 @@ IMAP_USER = os.environ["IMAP_USER"]
 IMAP_PASSWORD = os.environ["IMAP_PASSWORD"]
 IMAP_REPORTS_FOLDER = os.environ.get("IMAP_REPORTS_FOLDER", "INBOX")
 IMAP_ARCHIVE_FOLDER = os.environ.get("IMAP_ARCHIVE_FOLDER", "Processed")
+# 0 = geen limiet, verwerk alles wat er in reports_folder ligt. parsedmarc's
+# eigen default is 10 per run, prima voor normaal verkeer maar te traag om
+# een opgebouwde achterstand in te lopen.
+IMAP_BATCH_SIZE = int(os.environ.get("IMAP_BATCH_SIZE", "0"))
 
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("DB_PORT", "5432"))
@@ -433,6 +437,7 @@ def main() -> int:
             archive_folder=IMAP_ARCHIVE_FOLDER,
             offline=DMARC_OFFLINE,
             save_callback=make_save_callback(conn),
+            batch_size=IMAP_BATCH_SIZE,
         )
 
         logger.info(
