@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Cron job: haal DMARC aggregate reports op via IMAP en sla ze op in Postgres.
+"""Cron job: fetch DMARC aggregate reports over IMAP and store them in Postgres.
 
-Bedoeld om elk uur te draaien. Gebruikt parsedmarc om mail te lezen, bijlagen
-(.gz/.zip/.xml) te decoderen en te parsen. Verwerkte mail wordt door
-parsedmarc automatisch verplaatst naar {archive_folder}/Aggregate (of
-.../Invalid bij een kapot rapport), zodat een volgende run nooit dezelfde
-mail opnieuw ziet.
+Meant to run hourly. Uses parsedmarc to read mail, decode and parse attachments
+(.gz/.zip/.xml). Processed mail is automatically moved by parsedmarc to
+{archive_folder}/Aggregate (or .../Invalid for a broken report), so a
+subsequent run never sees the same mail again.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -34,9 +34,9 @@ IMAP_USER = os.environ["IMAP_USER"]
 IMAP_PASSWORD = os.environ["IMAP_PASSWORD"]
 IMAP_REPORTS_FOLDER = os.environ.get("IMAP_REPORTS_FOLDER", "INBOX")
 IMAP_ARCHIVE_FOLDER = os.environ.get("IMAP_ARCHIVE_FOLDER", "Processed")
-# 0 = geen limiet, verwerk alles wat er in reports_folder ligt. parsedmarc's
-# eigen default is 10 per run, prima voor normaal verkeer maar te traag om
-# een opgebouwde achterstand in te lopen.
+# 0 = no limit, process everything sitting in reports_folder. parsedmarc's own
+# default is 10 per run, fine for normal traffic but too slow to work through
+# a backlog.
 IMAP_BATCH_SIZE = int(os.environ.get("IMAP_BATCH_SIZE", "0"))
 
 DB_HOST = os.environ.get("DB_HOST", "localhost")
@@ -45,8 +45,8 @@ DB_NAME = os.environ.get("DB_NAME", "dmarc")
 DB_USER = os.environ.get("DB_USER", "dmarc")
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
-# Zet op "false" zodra de server (192.168.93.11) uitgaand internet heeft en je
-# reverse-DNS/land-verrijking van bron-IP's wilt; anders blijven die kolommen NULL.
+# Set to "false" once the server (192.168.93.11) has outbound internet and you
+# want reverse-DNS/country enrichment of source IPs; otherwise those columns stay NULL.
 DMARC_OFFLINE = os.environ.get("DMARC_OFFLINE", "true").lower() != "false"
 
 SCHEMA_SQL = """
@@ -104,6 +104,15 @@ CREATE TABLE IF NOT EXISTS dmarc.aggregate_record_spf_results (
     result TEXT
 );
 
+-- The receiver can state its own reason why a non-aligned message wasn't
+-- (fully) enforced anyway, e.g. type=local_policy for forwarding/mailing lists.
+CREATE TABLE IF NOT EXISTS dmarc.aggregate_record_policy_override_reasons (
+    id BIGSERIAL PRIMARY KEY,
+    record_id BIGINT NOT NULL REFERENCES dmarc.aggregate_records (id) ON DELETE CASCADE,
+    type TEXT,
+    comment TEXT
+);
+
 CREATE TABLE IF NOT EXISTS dmarc.smtp_tls_reports (
     id BIGSERIAL PRIMARY KEY,
     organization_name TEXT NOT NULL,
@@ -139,9 +148,10 @@ CREATE TABLE IF NOT EXISTS dmarc.smtp_tls_failure_details (
     failure_reason_code TEXT
 );
 
--- Lichte tracker voor forensic/failure (ruf) reports: alleen technische
--- kenmerken, geen mail-inhoud/headers/derde-partij-adressen (privacygevoelig).
--- Doel is puur zichtbaar maken OF en hoe vaak deze binnenkomen.
+-- Lightweight tracker for forensic/failure (ruf) reports: technical
+-- characteristics only, no mail content/headers/third-party addresses (privacy
+-- sensitive). The goal is purely to make visible WHETHER and how often these
+-- come in.
 CREATE TABLE IF NOT EXISTS dmarc.failure_reports_seen (
     id BIGSERIAL PRIMARY KEY,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -173,23 +183,33 @@ def ensure_schema(conn: psycopg2.extensions.connection) -> None:
 
 
 def _parse_naive_local(timestamp: str) -> datetime:
-    # parsedmarc geeft "YYYY-MM-DD HH:MM:SS" terug in de systeem-tijdzone van
-    # de machine die parsed (niet per se UTC). astimezone() zonder argument
-    # plakt daar de juiste lokale tzinfo op, zodat psycopg2 het absolute
-    # moment correct doorgeeft ongeacht de timezone-instelling van Postgres.
+    # parsedmarc returns "YYYY-MM-DD HH:MM:SS" in the system timezone of the
+    # machine doing the parsing (not necessarily UTC). astimezone() with no
+    # argument attaches the correct local tzinfo, so psycopg2 passes on the
+    # absolute moment correctly regardless of Postgres's timezone setting.
     return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").astimezone()
 
 
 def _parse_naive_utc(timestamp: str) -> datetime:
-    # arrival_date_utc is door parsedmarc al naar UTC omgerekend; de string
-    # zelf draagt alleen geen tzinfo, dus hier UTC direct plakken (niet
-    # astimezone() gebruiken, dat zou lokale tijd aannemen).
+    # arrival_date_utc has already been converted to UTC by parsedmarc; the
+    # string itself just carries no tzinfo, so attach UTC directly here (don't
+    # use astimezone(), which would assume local time).
     return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
-def store_aggregate_report(cur, report: AggregateReport) -> None:
+def store_aggregate_report(cur, report: AggregateReport, backfill: bool = False) -> None:
     metadata = report["report_metadata"]
     policy = report["policy_published"]
+
+    if backfill:
+        # Delete any existing report first (cascade cleans up records/dkim/spf/
+        # override-reasons automatically), so it's always freshly inserted below
+        # using the current parsing logic — including fields that weren't
+        # captured back then (e.g. policy_override_reasons).
+        cur.execute(
+            "DELETE FROM dmarc.aggregate_reports WHERE org_name = %s AND report_id = %s",
+            (metadata["org_name"], metadata["report_id"]),
+        )
 
     cur.execute(
         """
@@ -219,7 +239,7 @@ def store_aggregate_report(cur, report: AggregateReport) -> None:
     row = cur.fetchone()
     if row is None:
         logger.info(
-            "Report %s van %s bestaat al, records overslaan",
+            "Report %s from %s already exists, skipping records",
             metadata["report_id"],
             metadata["org_name"],
         )
@@ -294,6 +314,16 @@ def store_aggregate_report(cur, report: AggregateReport) -> None:
                 ),
             )
 
+        for reason in policy_evaluated.get("policy_override_reasons", []):
+            cur.execute(
+                """
+                INSERT INTO dmarc.aggregate_record_policy_override_reasons
+                    (record_id, type, comment)
+                VALUES (%s, %s, %s)
+                """,
+                (record_db_id, reason.get("type"), reason.get("comment")),
+            )
+
 
 def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
     contact_info = report["contact_info"]
@@ -319,7 +349,7 @@ def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
     row = cur.fetchone()
     if row is None:
         logger.info(
-            "TLS-RPT report %s van %s bestaat al, policies overslaan",
+            "TLS-RPT report %s from %s already exists, skipping policies",
             report["report_id"],
             report["organization_name"],
         )
@@ -392,12 +422,12 @@ def store_failure_report_summary(cur, report: FailureReport) -> None:
     )
 
 
-def make_save_callback(conn: psycopg2.extensions.connection):
+def make_save_callback(conn: psycopg2.extensions.connection, backfill: bool = False):
     def save_callback(batch: ParsingResults) -> bool:
         try:
             with conn.cursor() as cur:
                 for report in batch["aggregate_reports"]:
-                    store_aggregate_report(cur, report)
+                    store_aggregate_report(cur, report, backfill=backfill)
                 for report in batch["smtp_tls_reports"]:
                     store_smtp_tls_report(cur, report)
                 for report in batch["failure_reports"]:
@@ -405,20 +435,41 @@ def make_save_callback(conn: psycopg2.extensions.connection):
             conn.commit()
         except Exception:
             conn.rollback()
-            logger.exception("Opslaan van batch mislukt, wordt volgende run opnieuw geprobeerd")
+            logger.exception("Failed to store batch, will retry next run")
             return False
         if batch["aggregate_reports"]:
-            logger.info("%d aggregate report(s) opgeslagen", len(batch["aggregate_reports"]))
+            verb = "reprocessed" if backfill else "stored"
+            logger.info("%d aggregate report(s) %s", len(batch["aggregate_reports"]), verb)
         if batch["smtp_tls_reports"]:
-            logger.info("%d TLS-RPT report(s) opgeslagen", len(batch["smtp_tls_reports"]))
+            logger.info("%d TLS-RPT report(s) stored", len(batch["smtp_tls_reports"]))
         if batch["failure_reports"]:
-            logger.info("%d failure report(s) gezien (alleen samenvatting bewaard)", len(batch["failure_reports"]))
+            logger.info("%d failure report(s) seen (summary only kept)", len(batch["failure_reports"]))
         return True
 
     return save_callback
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch DMARC reports over IMAP and store them in Postgres."
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "Reprocess aggregate reports already sitting in "
+            f"{IMAP_ARCHIVE_FOLDER}/Aggregate, instead of fetching new mail from "
+            f"{IMAP_REPORTS_FOLDER}. Existing reports are deleted and reinserted "
+            "using the current parsing logic (this retroactively fills in e.g. "
+            "fields added later). Never moves or deletes mail."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> int:
+    args = parse_args()
+
     conn = get_connection()
     try:
         ensure_schema(conn)
@@ -431,6 +482,22 @@ def main() -> int:
             ssl=True,
         )
 
+        if args.backfill:
+            results = get_dmarc_reports_from_mailbox(
+                mailbox,
+                reports_folder=f"{IMAP_ARCHIVE_FOLDER}/Aggregate",
+                archive_folder=IMAP_ARCHIVE_FOLDER,
+                offline=DMARC_OFFLINE,
+                save_callback=make_save_callback(conn, backfill=True),
+                batch_size=IMAP_BATCH_SIZE,
+                test=True,  # never move/delete mail during a backfill
+            )
+            logger.info(
+                "Backfill complete: %d aggregate report(s) reprocessed",
+                len(results["aggregate_reports"]),
+            )
+            return 0
+
         results = get_dmarc_reports_from_mailbox(
             mailbox,
             reports_folder=IMAP_REPORTS_FOLDER,
@@ -441,13 +508,13 @@ def main() -> int:
         )
 
         logger.info(
-            "Run klaar: %d aggregate, %d failure, %d smtp_tls reports gezien",
+            "Run complete: %d aggregate, %d failure, %d smtp_tls reports seen",
             len(results["aggregate_reports"]),
             len(results["failure_reports"]),
             len(results["smtp_tls_reports"]),
         )
     except Exception:
-        logger.exception("DMARC fetch run mislukt")
+        logger.exception("DMARC fetch run failed")
         return 1
     finally:
         conn.close()

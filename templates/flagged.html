@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+    <p class="summary">{{ flagged_records | length }} non-DMARC-aligned messages (latest 200)</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Organization</th>
+                <th>Source IP</th>
+                <th>Country</th>
+                <th>Header-From</th>
+                <th>Envelope-From</th>
+                <th>Count</th>
+                <th>Outcome</th>
+                <th>Reason</th>
+                <th>Receiver's explanation</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in flagged_records %}
+            <tr>
+                <td>{{ r.interval_begin.strftime('%Y-%m-%d') }}</td>
+                <td>{{ r.org_name }}</td>
+                <td>{{ r.source_ip }}</td>
+                <td>{{ r.flag }} {{ r.source_country or '-' }}</td>
+                <td>{{ r.header_from or '-' }}</td>
+                <td>{{ r.envelope_from or '-' }}</td>
+                <td>{{ r.count }}</td>
+                <td>{{ r.disposition }}</td>
+                <td class="reason">{{ r.reason }}</td>
+                <td class="reason">{{ r.override_reason or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

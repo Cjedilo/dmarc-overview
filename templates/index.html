@@ -1,22 +1,8 @@
-<!doctype html>
-<html lang="nl">
-<head>
-    <meta charset="utf-8">
-    <title>DMARC overview</title>
-    <style>
-        body { font-family: sans-serif; margin: 2rem; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
-        th { background: #f0f0f0; }
-        .summary { margin-bottom: 1.5rem; font-size: 1.1rem; }
-    </style>
-</head>
-<body>
-    <h1>DMARC overview</h1>
-
+{% extends "base.html" %}
+{% block content %}
     <p class="summary">
-        {{ summary.total_reports }} rapporten,
-        {{ summary.total_messages }} berichten totaal,
+        {{ summary.total_reports }} reports,
+        {{ summary.total_messages }} messages total,
         {{ summary.aligned_messages }} DMARC-aligned
         {% if summary.total_messages %}
             ({{ (100 * summary.aligned_messages / summary.total_messages) | round(1) }}%)
@@ -26,10 +12,10 @@
     <table>
         <thead>
             <tr>
-                <th>Organisatie</th>
-                <th>Domein</th>
-                <th>Periode</th>
-                <th>Berichten</th>
+                <th>Organization</th>
+                <th>Domain</th>
+                <th>Period</th>
+                <th>Messages</th>
                 <th>Aligned</th>
                 <th>Quarantine</th>
                 <th>Reject</th>
@@ -49,5 +35,4 @@
             {% endfor %}
         </tbody>
     </table>
-</body>
-</html>
+{% endblock %}

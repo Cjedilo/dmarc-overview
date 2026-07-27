@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block content %}
+    <p class="summary">
+        {{ totals.get('auth_failures', 0) }} failed login attempts,
+        {{ totals.get('rejects_given', 0) }} rejects given,
+        {{ totals.get('rejects_received', 0) }} rejects received
+        <br><span style="font-size: 0.8rem; color: #666;">
+            From this mail server's own logs (Postfix/Dovecot on coador), not DMARC reports.
+        </span>
+    </p>
+
+    <h2 style="font-size: 1.1rem;">Failed login attempts, by source IP</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Source IP</th>
+                <th>Country</th>
+                <th>Reverse DNS</th>
+                <th>Attempts</th>
+                <th>Usernames tried</th>
+                <th>Services</th>
+                <th>First seen</th>
+                <th>Last seen</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in auth_sources %}
+            <tr>
+                <td>{{ r.source_ip }}</td>
+                <td>{{ r.flag }} {{ r.country or '-' }}</td>
+                <td>{{ r.reverse_dns or '-' }}</td>
+                <td>{{ r.attempts }}</td>
+                <td>{{ r.distinct_usernames }}</td>
+                <td>{{ r.services }}</td>
+                <td>{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td>{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <h2 style="font-size: 1.1rem; margin-top: 2rem;">Rejects given (incoming mail we refused)</h2>
+    <p class="summary">Latest {{ rejects_given | length }}</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Source</th>
+                <th>Code</th>
+                <th>Reason</th>
+                <th>From</th>
+                <th>To</th>
+                <th>HELO</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in rejects_given %}
+            <tr>
+                <td>{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td>{{ r.source_host }} [{{ r.source_ip }}]</td>
+                <td>{{ (r.smtp_code ~ ' ' if r.smtp_code) }}{{ r.enhanced_code or '' }}</td>
+                <td class="reason">{{ r.reason }}</td>
+                <td>{{ r.mail_from or '-' }}</td>
+                <td>{{ r.rcpt_to or '-' }}</td>
+                <td>{{ r.helo or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <h2 style="font-size: 1.1rem; margin-top: 2rem;">Rejects received (our outbound mail refused elsewhere)</h2>
+    <p class="summary">Latest {{ rejects_received | length }}</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>To</th>
+                <th>Original To</th>
+                <th>Relay</th>
+                <th>DSN</th>
+                <th>Reason</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in rejects_received %}
+            <tr>
+                <td>{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td>{{ r.mail_to }}</td>
+                <td>{{ r.orig_to or '-' }}</td>
+                <td>{{ r.relay }}</td>
+                <td>{{ r.dsn_code }}</td>
+                <td class="reason">{{ r.reason }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

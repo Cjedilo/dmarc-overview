@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+
+{% block extra_head %}
+<style>
+    .viz-root {
+        --surface-1: #fcfcfb;
+        --text-secondary: #52514e;
+        --muted: #898781;
+        --gridline: #e1e0d9;
+        --baseline: #c3c2b7;
+        --status-good: #0ca30c;
+        --status-warning: #fab219;
+        --status-critical: #d03b3b;
+    }
+
+    .chart-card { background: var(--surface-1); border: 1px solid #ddd; border-radius: 4px;
+                  padding: 1.2rem 1.5rem; margin-bottom: 1.5rem; }
+    .chart-card h2 { margin-top: 0; font-size: 1.1rem; }
+    .chart-card--daily { --bar-width: 16px; --bar-gap: 4px; }
+    .chart-card--monthly { --bar-width: 20px; --bar-gap: 8px; }
+
+    .chart-legend { display: flex; gap: 1.5rem; margin-bottom: 1.5rem; font-size: 0.85rem; color: var(--text-secondary); }
+    .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+    .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+    .chart-plot { display: flex; }
+    .chart-yaxis { display: flex; flex-direction: column; justify-content: space-between;
+                   height: {{ plot_height }}px; margin-right: 10px; text-align: right; flex-shrink: 0; }
+    .ytick { font-size: 0.7rem; color: var(--muted); transform: translateY(-0.5em); }
+
+    /* Bars sit in their own box, exactly plot_height tall, so the bottom border
+       is the true zero-line — it must never include the labels below it. */
+    .chart-bars { display: flex; align-items: flex-end; gap: var(--bar-gap, 8px);
+                  border-left: 1px solid var(--baseline); border-bottom: 1px solid var(--baseline);
+                  padding-left: 10px; height: {{ plot_height }}px; }
+
+    .bar-stack { display: flex; flex-direction: column; justify-content: flex-end; gap: 2px;
+                 height: {{ plot_height }}px; width: var(--bar-width, 20px); cursor: pointer; }
+    .bar-stack[tabindex]:focus { outline: 2px solid var(--status-good); outline-offset: 2px; }
+    .seg { width: var(--bar-width, 20px); border-radius: 4px 4px 0 0; }
+    .seg-aligned { background: var(--status-good); }
+    .seg-quarantine { background: var(--status-warning); }
+    .seg-reject { background: var(--status-critical); }
+
+    /* Monthly labels: rotated, in their own row below the axis, same left
+       offset (border + padding) and gap as .chart-bars so each label lines up
+       under its bar. Rotated text doesn't affect layout size, so this row
+       gets extra margin to hold it without colliding with whatever comes
+       after. The label's pivot must sit exactly at this cell's top-right
+       corner (= the bar's right edge) no matter how wide the text is —
+       text-align on an inline-block that overflows its cell doesn't reliably
+       pin the pivot there, so anchor it with absolute positioning instead. */
+    .chart-xlabels { display: flex; gap: var(--bar-gap, 8px); padding-left: 11px; margin-top: 8px; margin-bottom: 55px; }
+    .xlabel-cell { position: relative; width: var(--bar-width, 20px); }
+    .bar-xlabel { position: absolute; top: 0; right: 6px; font-size: 0.7rem; color: var(--muted);
+                  white-space: nowrap; transform: rotate(-45deg); transform-origin: top right; }
+
+    /* Daily labels: short day-of-month numbers, centered under each bar —
+       no rotation needed, they're narrower than the bar itself. */
+    .chart-daylabels { display: flex; gap: var(--bar-gap, 8px); padding-left: 11px; margin-top: 6px; }
+    .day-label { width: var(--bar-width, 20px); text-align: center; font-size: 0.65rem; color: var(--muted); }
+
+    .bar-link { display: block; text-decoration: none; color: inherit; border-radius: 4px 4px 0 0; }
+    .bar-link:focus { outline: 2px solid var(--status-good); outline-offset: 2px; }
+    .bar-link.active .bar-stack { outline: 2px solid var(--text-secondary); outline-offset: 2px; }
+
+    .chart-tooltip { position: absolute; background: #0b0b0b; color: #fff; padding: 0.5rem 0.7rem;
+                      border-radius: 4px; font-size: 0.8rem; pointer-events: none; z-index: 10;
+                      white-space: nowrap; }
+    .chart-tooltip strong { display: block; margin-bottom: 0.2rem; }
+
+    .table-toggle { background: none; border: 1px solid #ccc; border-radius: 4px;
+                    padding: 0.4rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
+    .trend-table { margin-top: 1rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+    <figure class="viz-root chart-card chart-card--daily">
+        <figcaption>
+            <h2>Messages by outcome, per day &mdash; {{ daily_label }}</h2>
+        </figcaption>
+
+        <div class="chart-legend">
+            <span class="legend-item"><span class="swatch" style="background: var(--status-good)"></span>Aligned</span>
+            <span class="legend-item"><span class="swatch" style="background: var(--status-warning)"></span>Quarantine</span>
+            <span class="legend-item"><span class="swatch" style="background: var(--status-critical)"></span>Reject</span>
+        </div>
+
+        <div class="chart-plot">
+            <div class="chart-yaxis">
+                {% for tick in day_y_ticks %}<div class="ytick">{{ tick }}</div>{% endfor %}
+            </div>
+            <div>
+                <div class="chart-bars">
+                    {% for bar in day_bars %}
+                    <div class="bar-stack" tabindex="0" role="img"
+                         aria-label="{{ bar.full_label }}: {{ bar.aligned }} aligned, {{ bar.quarantine }} quarantine, {{ bar.reject }} reject"
+                         data-label="{{ bar.full_label }}" data-aligned="{{ bar.aligned }}"
+                         data-quarantine="{{ bar.quarantine }}" data-reject="{{ bar.reject }}">
+                        <div class="seg seg-reject" style="height: {{ bar.reject_h }}px"></div>
+                        <div class="seg seg-quarantine" style="height: {{ bar.quarantine_h }}px"></div>
+                        <div class="seg seg-aligned" style="height: {{ bar.aligned_h }}px"></div>
+                    </div>
+                    {% endfor %}
+                </div>
+                <div class="chart-daylabels">
+                    {% for bar in day_bars %}<div class="day-label">{{ bar.label }}</div>{% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <button type="button" class="table-toggle" id="daily-table-toggle" aria-expanded="false">View as table</button>
+        <table class="trend-table" id="daily-table" hidden>
+            <thead>
+                <tr><th>Day</th><th>Aligned</th><th>Quarantine</th><th>Reject</th><th>Total</th></tr>
+            </thead>
+            <tbody>
+                {% for bar in day_bars %}
+                <tr>
+                    <td>{{ bar.full_label }}</td>
+                    <td>{{ bar.aligned }}</td>
+                    <td>{{ bar.quarantine }}</td>
+                    <td>{{ bar.reject }}</td>
+                    <td>{{ bar.total }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </figure>
+
+    <figure class="viz-root chart-card chart-card--monthly">
+        <figcaption>
+            <h2>Messages by outcome, per month</h2>
+            <p style="font-size: 0.8rem; color: var(--text-secondary); margin-top: -0.5rem;">
+                Click a month to see its days above{% if active_month %} &mdash; <a href="{{ url_for('trend') }}">back to last 31 days</a>{% endif %}
+            </p>
+        </figcaption>
+
+        <div class="chart-legend">
+            <span class="legend-item"><span class="swatch" style="background: var(--status-good)"></span>Aligned</span>
+            <span class="legend-item"><span class="swatch" style="background: var(--status-warning)"></span>Quarantine</span>
+            <span class="legend-item"><span class="swatch" style="background: var(--status-critical)"></span>Reject</span>
+        </div>
+
+        <div class="chart-plot">
+            <div class="chart-yaxis">
+                {% for tick in month_y_ticks %}<div class="ytick">{{ tick }}</div>{% endfor %}
+            </div>
+            <div>
+                <div class="chart-bars">
+                    {% for bar in month_bars %}
+                    <a class="bar-link{{ ' active' if bar.month_key == active_month else '' }}"
+                       href="{{ url_for('trend', month=bar.month_key) }}"
+                       aria-label="{{ bar.label }}: {{ bar.aligned }} aligned, {{ bar.quarantine }} quarantine, {{ bar.reject }} reject. Click to see this month's days."
+                       data-label="{{ bar.label }}" data-aligned="{{ bar.aligned }}"
+                       data-quarantine="{{ bar.quarantine }}" data-reject="{{ bar.reject }}">
+                        <div class="bar-stack">
+                            <div class="seg seg-reject" style="height: {{ bar.reject_h }}px"></div>
+                            <div class="seg seg-quarantine" style="height: {{ bar.quarantine_h }}px"></div>
+                            <div class="seg seg-aligned" style="height: {{ bar.aligned_h }}px"></div>
+                        </div>
+                    </a>
+                    {% endfor %}
+                </div>
+                <div class="chart-xlabels">
+                    {% for bar in month_bars %}
+                    <div class="xlabel-cell"><span class="bar-xlabel">{{ bar.label }}</span></div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <button type="button" class="table-toggle" id="monthly-table-toggle" aria-expanded="false">View as table</button>
+        <table class="trend-table" id="monthly-table" hidden>
+            <thead>
+                <tr><th>Month</th><th>Aligned</th><th>Quarantine</th><th>Reject</th><th>Total</th></tr>
+            </thead>
+            <tbody>
+                {% for bar in month_bars %}
+                <tr>
+                    <td>{{ bar.label }}</td>
+                    <td>{{ bar.aligned }}</td>
+                    <td>{{ bar.quarantine }}</td>
+                    <td>{{ bar.reject }}</td>
+                    <td>{{ bar.total }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </figure>
+
+    <div id="chart-tooltip" class="chart-tooltip" role="tooltip" hidden></div>
+{% endblock %}
+
+{% block extra_body %}
+<script>
+(function () {
+    var tooltip = document.getElementById('chart-tooltip');
+
+    function showTooltip(el) {
+        var label = el.dataset.label;
+        var aligned = el.dataset.aligned;
+        var quarantine = el.dataset.quarantine;
+        var reject = el.dataset.reject;
+
+        tooltip.textContent = '';
+        var title = document.createElement('strong');
+        title.textContent = label;
+        tooltip.appendChild(title);
+
+        [['Aligned', aligned], ['Quarantine', quarantine], ['Reject', reject]].forEach(function (row) {
+            var line = document.createElement('div');
+            line.textContent = row[0] + ': ' + row[1];
+            tooltip.appendChild(line);
+        });
+
+        tooltip.hidden = false;
+        var rect = el.getBoundingClientRect();
+        var top = rect.top + window.scrollY - tooltip.offsetHeight - 10;
+        tooltip.style.left = (rect.left + window.scrollX + rect.width / 2 - tooltip.offsetWidth / 2) + 'px';
+        tooltip.style.top = top + 'px';
+    }
+
+    function hideTooltip() {
+        tooltip.hidden = true;
+    }
+
+    document.querySelectorAll('.bar-stack[tabindex], .bar-link').forEach(function (el) {
+        el.addEventListener('pointerenter', function () { showTooltip(el); });
+        el.addEventListener('pointermove', function () { showTooltip(el); });
+        el.addEventListener('pointerleave', hideTooltip);
+        el.addEventListener('focus', function () { showTooltip(el); });
+        el.addEventListener('blur', hideTooltip);
+    });
+
+    function wireTableToggle(buttonId, tableId) {
+        var toggleBtn = document.getElementById(buttonId);
+        var table = document.getElementById(tableId);
+        toggleBtn.addEventListener('click', function () {
+            var expanded = toggleBtn.getAttribute('aria-expanded') === 'true';
+            toggleBtn.setAttribute('aria-expanded', String(!expanded));
+            table.hidden = expanded;
+            toggleBtn.textContent = expanded ? 'View as table' : 'Hide table';
+        });
+    }
+
+    wireTableToggle('daily-table-toggle', 'daily-table');
+    wireTableToggle('monthly-table-toggle', 'monthly-table');
+})();
+</script>
+{% endblock %}

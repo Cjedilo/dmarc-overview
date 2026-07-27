@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+    <p class="summary">{{ source_rows | length }} distinct source IPs, by total volume</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Source IP</th>
+                <th>Country</th>
+                <th>Reverse DNS</th>
+                <th>Total</th>
+                <th>Aligned</th>
+                <th>Aligned %</th>
+                <th>Quarantine</th>
+                <th>Reject</th>
+                <th>First seen</th>
+                <th>Last seen</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in source_rows %}
+            <tr>
+                <td>{{ r.source_ip }}</td>
+                <td>{{ r.flag }} {{ r.source_country or '-' }}</td>
+                <td>{{ r.source_reverse_dns or '-' }}</td>
+                <td>{{ r.total }}</td>
+                <td>{{ r.aligned }}</td>
+                <td>{{ r.aligned_pct }}%</td>
+                <td>{{ r.quarantine }}</td>
+                <td>{{ r.reject }}</td>
+                <td>{{ r.first_seen.strftime('%Y-%m-%d') }}</td>
+                <td>{{ r.last_seen.strftime('%Y-%m-%d') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}
