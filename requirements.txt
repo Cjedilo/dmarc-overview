@@ -1,4 +1,5 @@
 Flask
+gunicorn
 parsedmarc
 psycopg2-binary
 python-dotenv
