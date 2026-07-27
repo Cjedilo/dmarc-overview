@@ -23,6 +23,29 @@ AUTH_SERVICE_LABELS = {
 
 app = Flask(__name__)
 
+
+class PrefixMiddleware:
+    """Makes url_for() emit /dmarc/... links when Apache reverse-proxies this
+    app under that subpath. Apache sends X-Forwarded-Prefix: /dmarc (see the
+    vhost config); without this, every internal link would resolve against
+    the domain root and 404, since Flask has no idea it isn't mounted at /.
+    """
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        prefix = environ.get("HTTP_X_FORWARDED_PREFIX", "")
+        if prefix:
+            environ["SCRIPT_NAME"] = prefix
+            path_info = environ.get("PATH_INFO", "")
+            if path_info.startswith(prefix):
+                environ["PATH_INFO"] = path_info[len(prefix):]
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = PrefixMiddleware(app.wsgi_app)
+
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("DB_PORT", "5432"))
 DB_NAME = os.environ.get("DB_NAME", "dmarc")

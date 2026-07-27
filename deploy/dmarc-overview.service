@@ -1,0 +1,15 @@
+[Unit]
+Description=DMARC overview (Flask via Gunicorn)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=bas
+Group=bas
+WorkingDirectory=/home/bas/src/dmarc-overview
+ExecStart=/home/bas/src/dmarc-overview/venv/bin/gunicorn --bind 127.0.0.1:8001 --workers 2 app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
