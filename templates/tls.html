@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+    <p class="summary">{{ policy_rows | length }} TLS-RPT policy result(s) (latest 200)</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Period end</th>
+                <th>Reporting organization</th>
+                <th>Policy domain</th>
+                <th>Policy type</th>
+                <th>Successful</th>
+                <th>Failed</th>
+                <th>Failure rate</th>
+                <th>Failure details</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in policy_rows %}
+            <tr>
+                <td>{{ r.date_end.strftime('%Y-%m-%d') }}</td>
+                <td>{{ r.organization_name }}</td>
+                <td>{{ r.policy_domain }}</td>
+                <td>{{ r.policy_type }}</td>
+                <td>{{ r.successful_session_count }}</td>
+                <td>{{ r.failed_session_count }}</td>
+                <td>{{ r.failure_rate_pct }}%</td>
+                <td class="reason">{{ r.failure_summary or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

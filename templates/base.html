@@ -109,6 +109,7 @@
             <a href="{{ url_for('flagged') }}" class="{{ 'active' if active_page == 'flagged' else '' }}">Flagged mail</a>
             <a href="{{ url_for('trend') }}" class="{{ 'active' if active_page == 'trend' else '' }}">Volume over time</a>
             <a href="{{ url_for('sources') }}" class="{{ 'active' if active_page == 'sources' else '' }}">Top sources</a>
+            <a href="{{ url_for('tls_reports') }}" class="{{ 'active' if active_page == 'tls' else '' }}">TLS reports</a>
         </nav>
         <main>
             {% block content %}{% endblock %}

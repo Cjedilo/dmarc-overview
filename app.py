@@ -662,5 +662,58 @@ def security():
     )
 
 
+@app.route("/tls")
+def tls_reports():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            domain_status = get_domain_overview(cur)
+
+            cur.execute(
+                """
+                SELECT
+                    r.organization_name,
+                    r.date_begin,
+                    r.date_end,
+                    p.policy_domain,
+                    p.policy_type,
+                    p.successful_session_count,
+                    p.failed_session_count,
+                    (
+                        SELECT string_agg(
+                            fd.result_type || ' (' || fd.failed_session_count || 'x' ||
+                                CASE WHEN fd.receiving_mx_hostname IS NOT NULL
+                                     THEN ' at ' || fd.receiving_mx_hostname ELSE '' END ||
+                                CASE WHEN fd.sending_mta_ip IS NOT NULL
+                                     THEN ' from ' || fd.sending_mta_ip ELSE '' END ||
+                                ')',
+                            '; '
+                        )
+                        FROM dmarc.smtp_tls_failure_details fd
+                        WHERE fd.policy_id = p.id
+                    ) AS failure_summary
+                FROM dmarc.smtp_tls_policies p
+                JOIN dmarc.smtp_tls_reports r ON r.id = p.report_id
+                ORDER BY r.date_end DESC, r.organization_name
+                LIMIT 200
+                """
+            )
+            policy_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for p in policy_rows:
+        total = p["successful_session_count"] + p["failed_session_count"]
+        p["total"] = total
+        p["failure_rate_pct"] = round(100 * p["failed_session_count"] / total) if total else 0
+
+    return render_template(
+        "tls.html",
+        active_page="tls",
+        domain_status=domain_status,
+        policy_rows=policy_rows,
+    )
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=True)
