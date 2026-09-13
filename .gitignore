@@ -1,3 +1,4 @@
+cron.log
 venv/
 __pycache__/
 *.pyc
