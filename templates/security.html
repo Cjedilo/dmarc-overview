@@ -3,13 +3,48 @@
     <p class="summary">
         {{ totals.get('auth_failures', 0) }} failed login attempts,
         {{ totals.get('rejects_given', 0) }} rejects given,
-        {{ totals.get('rejects_received', 0) }} rejects received
+        {{ totals.get('rejects_received', 0) }} rejects received,
+        {{ totals.get('dmarc_dkim_marked', 0) }} incoming mail marked (not rejected) for DMARC/DKIM
         <br><span style="font-size: 0.8rem; color: #666;">
-            From this mail server's own logs (Postfix/Dovecot on coador), not DMARC reports.
+            From this mail server's own logs (Postfix/Dovecot/OpenDMARC on coador), not DMARC reports.
         </span>
     </p>
 
-    <h2 style="font-size: 1.1rem;">Failed login attempts, by source IP</h2>
+    <h2 style="font-size: 1.1rem;">Incoming mail marked for DMARC/DKIM, not rejected, by source IP</h2>
+    <p class="summary">
+        OpenDMARC's RejectFailures is off, so these messages were delivered anyway &ndash; this is who's sending them.
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th>Source IP</th>
+                <th>Country</th>
+                <th>Reverse DNS</th>
+                <th>Marked</th>
+                <th>Claimed domain(s)</th>
+                <th>First seen</th>
+                <th>Last seen</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in dmarc_fail_sources %}
+            <tr>
+                <td>{{ r.source_ip or '-' }}</td>
+                <td>{{ r.flag }} {{ r.country or '-' }}</td>
+                <td>{{ r.reverse_dns or '-' }}</td>
+                <td>{{ r.total }}</td>
+                <td>{{ r.domains | join(', ') }}</td>
+                <td>{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td>{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+            </tr>
+            {% endfor %}
+            {% if not dmarc_fail_sources %}
+            <tr><td colspan="7"><em>None yet.</em></td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+
+    <h2 style="font-size: 1.1rem; margin-top: 2rem;">Failed login attempts, by source IP</h2>
     <table>
         <thead>
             <tr>

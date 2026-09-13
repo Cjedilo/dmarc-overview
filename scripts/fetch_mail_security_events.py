@@ -11,13 +11,18 @@ run (cheap: a few MB), relying on a hash-of-the-raw-line uniqueness
 constraint per table to make re-runs a no-op for lines already stored. This
 avoids fragile byte-offset/rotation-tracking state.
 
-Covers four event categories:
+Covers six event categories:
   - failed IMAP/POP3 logins (Dovecot)
   - failed SMTP AUTH (Postfix smtpd/submission, credential brute-forcing)
   - rejects WE give (Postfix smtpd "reject:" lines: RBL blocks, malformed
     HELO relay probes, etc.)
   - rejects WE receive (Postfix smtp "status=bounced": our own outbound
     mail refused by someone else's server)
+  - incoming SMTP client IPs (Postfix smtpd "client=" lines) — kept only to
+    resolve the source IP for a queue-id, joined against DMARC results below
+  - OpenDMARC's per-message SPF/DMARC verdict lines. RejectFailures is off
+    (see /etc/opendmarc.conf on the mail server), so a "fail" here means the
+    message was marked, not rejected.
 """
 from __future__ import annotations
 
@@ -90,6 +95,30 @@ CREATE TABLE IF NOT EXISTS mailsec.rejects_received (
     raw_line TEXT NOT NULL,
     line_hash TEXT NOT NULL UNIQUE
 );
+
+CREATE TABLE IF NOT EXISTS mailsec.smtp_clients (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    queue_id TEXT NOT NULL,
+    source_ip INET,
+    source_host TEXT,
+    raw_line TEXT NOT NULL,
+    line_hash TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS smtp_clients_queue_id_idx ON mailsec.smtp_clients (queue_id);
+
+CREATE TABLE IF NOT EXISTS mailsec.dmarc_results (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    queue_id TEXT NOT NULL,
+    component TEXT NOT NULL,
+    scope TEXT,
+    domain TEXT,
+    result TEXT,
+    raw_line TEXT NOT NULL,
+    line_hash TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS dmarc_results_queue_id_idx ON mailsec.dmarc_results (queue_id);
 """
 
 SYSLOG_TS_RE = re.compile(r"^(?P<ts>\w{3}\s+\d{1,2} \d{2}:\d{2}:\d{2}) \S+ (?P<rest>.*)$")
@@ -127,6 +156,21 @@ BOUNCED_RE = re.compile(
     r"(?:, orig_to=<(?P<orig_to>[^>]*)>)?, relay=(?P<relay>\S+), "
     r"delay=(?P<delay>[\d.]+), delays=(?P<delays>\S+), dsn=(?P<dsn>\S+), "
     r"status=bounced \((?P<reason>.*)\)$"
+)
+
+# Gives us the source IP for a queue-id, to join against OpenDMARC's verdict below.
+SMTPD_CLIENT_RE = re.compile(
+    r"postfix/smtpd\[\d+\]: (?P<queue>\S+): client=(?P<client_host>\S+)\[(?P<client_ip>[0-9a-fA-F.:]+)\]"
+)
+
+# OpenDMARC logs one line per authentication mechanism it checked, e.g.
+# "<queue>: SPF(mailfrom): example.com pass", plus one final overall-verdict
+# line with no mechanism prefix: "<queue>: example.com pass". That final line
+# is what actually determines mark-vs-pass (component ends up "dmarc").
+OPENDMARC_RESULT_RE = re.compile(
+    r"opendmarc\[\d+\]: (?P<queue>\S+): "
+    r"(?:(?P<mechanism>SPF|DKIM)\((?P<scope>[^)]*)\): )?"
+    r"(?P<domain>\S+) (?P<result>\S+)$"
 )
 
 
@@ -233,6 +277,30 @@ def parse_line(ts: datetime.datetime, rest: str, raw_line: str):
             "line_hash": _line_hash(raw_line),
         }
 
+    m = SMTPD_CLIENT_RE.search(rest)
+    if m:
+        return "smtp_clients", {
+            "occurred_at": ts,
+            "queue_id": m["queue"],
+            "source_ip": m["client_ip"],
+            "source_host": m["client_host"],
+            "raw_line": raw_line,
+            "line_hash": _line_hash(raw_line),
+        }
+
+    m = OPENDMARC_RESULT_RE.search(rest)
+    if m:
+        return "dmarc_results", {
+            "occurred_at": ts,
+            "queue_id": m["queue"],
+            "component": (m["mechanism"] or "dmarc").lower(),
+            "scope": m["scope"],
+            "domain": m["domain"],
+            "result": m["result"],
+            "raw_line": raw_line,
+            "line_hash": _line_hash(raw_line),
+        }
+
     return None, None
 
 
@@ -285,6 +353,20 @@ INSERT_SQL = {
                 %(dsn_code)s, %(reason)s, %(raw_line)s, %(line_hash)s)
         ON CONFLICT (line_hash) DO NOTHING
     """,
+    "smtp_clients": """
+        INSERT INTO mailsec.smtp_clients
+            (occurred_at, queue_id, source_ip, source_host, raw_line, line_hash)
+        VALUES (%(occurred_at)s, %(queue_id)s, %(source_ip)s, %(source_host)s,
+                %(raw_line)s, %(line_hash)s)
+        ON CONFLICT (line_hash) DO NOTHING
+    """,
+    "dmarc_results": """
+        INSERT INTO mailsec.dmarc_results
+            (occurred_at, queue_id, component, scope, domain, result, raw_line, line_hash)
+        VALUES (%(occurred_at)s, %(queue_id)s, %(component)s, %(scope)s, %(domain)s,
+                %(result)s, %(raw_line)s, %(line_hash)s)
+        ON CONFLICT (line_hash) DO NOTHING
+    """,
 }
 
 
@@ -302,7 +384,13 @@ def main() -> int:
     args = parse_args()
     reference = datetime.datetime.now()
 
-    counts = {"auth_failures": 0, "rejects_given": 0, "rejects_received": 0}
+    counts = {
+        "auth_failures": 0,
+        "rejects_given": 0,
+        "rejects_received": 0,
+        "smtp_clients": 0,
+        "dmarc_results": 0,
+    }
     skipped = 0
 
     conn = get_connection()
@@ -334,11 +422,13 @@ def main() -> int:
         conn.close()
 
     logger.info(
-        "Done: %d auth failures, %d rejects given, %d rejects received stored "
-        "(%d lines already seen, skipped)",
+        "Done: %d auth failures, %d rejects given, %d rejects received, "
+        "%d smtp clients, %d dmarc results stored (%d lines already seen, skipped)",
         counts["auth_failures"],
         counts["rejects_given"],
         counts["rejects_received"],
+        counts["smtp_clients"],
+        counts["dmarc_results"],
         skipped,
     )
     return 0

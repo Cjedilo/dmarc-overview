@@ -1,4 +1,5 @@
 import datetime
+import functools
 import math
 import os
 
@@ -558,15 +559,25 @@ def sources():
     )
 
 
+# The security/sources pages do one of these lookups per distinct source IP,
+# synchronously, per request — a couple of slow/unresponsive nameservers used
+# to be enough to make the page take tens of seconds. A short lifetime caps
+# the per-IP worst case, and caching means the same repeat-offender IPs
+# (which show up on every page load) don't get looked up again and again.
+DNS_LOOKUP_TIMEOUT = 2  # seconds
+
+
+@functools.lru_cache(maxsize=1024)
 def _reverse_dns(ip):
     try:
         rev_name = dns.reversename.from_address(ip)
-        answers = dns.resolver.resolve(rev_name, "PTR")
+        answers = dns.resolver.resolve(rev_name, "PTR", lifetime=DNS_LOOKUP_TIMEOUT)
         return str(answers[0]).rstrip(".")
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.DNSException, ValueError):
         return None
 
 
+@functools.lru_cache(maxsize=1024)
 def _country_for_ip(ip):
     # Team Cymru's free IP-to-ASN/country DNS service — same DNS-lookup
     # mechanism already used elsewhere in this file, no API key/library needed.
@@ -576,7 +587,7 @@ def _country_for_ip(ip):
             query_name = rev[: -len(".ip6.arpa.")] + ".origin6.asn.cymru.com"
         else:
             query_name = rev[: -len(".in-addr.arpa.")] + ".origin.asn.cymru.com"
-        answers = dns.resolver.resolve(query_name, "TXT")
+        answers = dns.resolver.resolve(query_name, "TXT", lifetime=DNS_LOOKUP_TIMEOUT)
         txt = "".join(s.decode() for s in answers[0].strings)
         parts = [p.strip() for p in txt.split("|")]
         return parts[2] if len(parts) > 2 else None
@@ -601,6 +612,8 @@ def security():
                 SELECT 'auth_failures' AS tbl, count(*) AS n FROM mailsec.auth_failures
                 UNION ALL SELECT 'rejects_given', count(*) FROM mailsec.rejects_given
                 UNION ALL SELECT 'rejects_received', count(*) FROM mailsec.rejects_received
+                UNION ALL SELECT 'dmarc_dkim_marked', count(*) FROM mailsec.dmarc_results
+                    WHERE component = 'dmarc' AND result <> 'pass'
                 """
             )
             totals = {r["tbl"]: r["n"] for r in cur.fetchall()}
@@ -648,6 +661,35 @@ def security():
                 """
             )
             rejects_received = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    c.source_ip,
+                    count(*) AS total,
+                    array_agg(DISTINCT d.domain ORDER BY d.domain) AS domains,
+                    min(d.occurred_at) AS first_seen,
+                    max(d.occurred_at) AS last_seen
+                FROM mailsec.dmarc_results d
+                LEFT JOIN LATERAL (
+                    SELECT source_ip
+                    FROM mailsec.smtp_clients sc
+                    WHERE sc.queue_id = d.queue_id
+                    ORDER BY abs(extract(epoch FROM sc.occurred_at - d.occurred_at))
+                    LIMIT 1
+                ) c ON true
+                WHERE d.component = 'dmarc' AND d.result <> 'pass'
+                GROUP BY c.source_ip
+                ORDER BY total DESC
+                LIMIT 50
+                """
+            )
+            dmarc_fail_sources = cur.fetchall()
+            for r in dmarc_fail_sources:
+                ip = str(r["source_ip"]) if r["source_ip"] else None
+                r["country"] = _country_for_ip(ip) if ip else None
+                r["flag"] = _country_flag(r["country"])
+                r["reverse_dns"] = _reverse_dns(ip) if ip else None
     finally:
         mailsec_conn.close()
 
@@ -659,6 +701,7 @@ def security():
         auth_sources=auth_sources,
         rejects_given=rejects_given,
         rejects_received=rejects_received,
+        dmarc_fail_sources=dmarc_fail_sources,
     )
 
 
