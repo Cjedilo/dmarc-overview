@@ -613,7 +613,7 @@ def security():
                 UNION ALL SELECT 'rejects_given', count(*) FROM mailsec.rejects_given
                 UNION ALL SELECT 'rejects_received', count(*) FROM mailsec.rejects_received
                 UNION ALL SELECT 'dmarc_dkim_marked', count(*) FROM mailsec.dmarc_results
-                    WHERE component = 'dmarc' AND result <> 'pass'
+                    WHERE component = 'dmarc' AND result = 'fail'
                 """
             )
             totals = {r["tbl"]: r["n"] for r in cur.fetchall()}
@@ -678,7 +678,7 @@ def security():
                     ORDER BY abs(extract(epoch FROM sc.occurred_at - d.occurred_at))
                     LIMIT 1
                 ) c ON true
-                WHERE d.component = 'dmarc' AND d.result <> 'pass'
+                WHERE d.component = 'dmarc' AND d.result = 'fail'
                 GROUP BY c.source_ip
                 ORDER BY total DESC
                 LIMIT 50
