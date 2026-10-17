@@ -145,7 +145,7 @@ REJECT_HEAD_RE = re.compile(
 CLEANUP_REJECT_RE = re.compile(
     r"postfix/cleanup\[\d+\]: (?P<queue>\S+): reject: (?P<stage>\w+) .* from "
     r"(?P<client_host>\S+)\[(?P<client_ip>[0-9a-fA-F.:]+)\]; "
-    r".*?: (?P<smtp_code>[\d.]+) \"(?P<reason>[^\"]*)\"\s*$"
+    r".*?: (?P<smtp_code>[\d.]+) \"?(?P<reason>.*?)\"?\s*$"
 )
 MAIL_FROM_RE = re.compile(r"\bfrom=<([^>]*)>")
 RCPT_TO_RE = re.compile(r"\bto=<([^>]*)>")
