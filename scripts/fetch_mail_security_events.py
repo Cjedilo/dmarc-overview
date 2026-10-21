@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cron job: parse this mail server's own Postfix/Dovecot logs for
+"""Cron job: parse this mail server's own Postfix/Dovecot/rspamd logs for
 security-relevant events and store them in Postgres (on the DB/web server).
 
 Runs ON the mail server itself (where the logs live), and connects out to
@@ -20,9 +20,10 @@ Covers six event categories:
     mail refused by someone else's server)
   - incoming SMTP client IPs (Postfix smtpd "client=" lines) — kept only to
     resolve the source IP for a queue-id, joined against DMARC results below
-  - OpenDMARC's per-message SPF/DMARC verdict lines. RejectFailures is off
-    (see /etc/opendmarc.conf on the mail server), so a "fail" here means the
-    message was marked, not rejected.
+  - rspamd's per-message DMARC verdict (DMARC_* symbols in its task log line,
+    /var/log/rspamd/rspamd.log; bas needs to be in group _rspamd to read it).
+    All actions are set to 999 in /etc/rspamd/local.d/actions.conf, so a
+    "fail" here means the message was marked, not rejected.
 """
 from __future__ import annotations
 
@@ -46,6 +47,8 @@ logger = logging.getLogger("fetch_mail_security_events")
 
 MAIL_LOG_DIR = Path(os.environ.get("MAIL_LOG_DIR", "/var/log"))
 MAIL_LOG_BASENAME = os.environ.get("MAIL_LOG_BASENAME", "mail.log")
+RSPAMD_LOG_DIR = Path(os.environ.get("RSPAMD_LOG_DIR", "/var/log/rspamd"))
+RSPAMD_LOG_BASENAME = os.environ.get("RSPAMD_LOG_BASENAME", "rspamd.log")
 
 DB_HOST = os.environ["MAILSEC_DB_HOST"]
 DB_PORT = int(os.environ.get("MAILSEC_DB_PORT", "5432"))
@@ -158,20 +161,31 @@ BOUNCED_RE = re.compile(
     r"status=bounced \((?P<reason>.*)\)$"
 )
 
-# Gives us the source IP for a queue-id, to join against OpenDMARC's verdict below.
+# Gives us the source IP for a queue-id, to join against rspamd's DMARC verdict below.
 SMTPD_CLIENT_RE = re.compile(
     r"postfix/smtpd\[\d+\]: (?P<queue>\S+): client=(?P<client_host>\S+)\[(?P<client_ip>[0-9a-fA-F.:]+)\]"
 )
 
-# OpenDMARC logs one line per authentication mechanism it checked, e.g.
-# "<queue>: SPF(mailfrom): example.com pass", plus one final overall-verdict
-# line with no mechanism prefix: "<queue>: example.com pass". That final line
-# is what actually determines mark-vs-pass (component ends up "dmarc").
-OPENDMARC_RESULT_RE = re.compile(
-    r"opendmarc\[\d+\]: (?P<queue>\S+): "
-    r"(?:(?P<mechanism>SPF|DKIM)\((?P<scope>[^)]*)\): )?"
-    r"(?P<domain>\S+) (?P<result>\S+)$"
+# rspamd logs one line per scanned message, with its own (non-syslog) timestamp:
+# "2026-10-21 13:53:39 #798494(normal) <e5ce44>; task; rspamd_task_write_log:
+#  id: <...>, qid: <7BD582200BB>, ip: ..., (default: F (no action): [0.23/999.00]
+#  [...,DMARC_POLICY_ALLOW(-0.50){breiwebshop.nl;reject;},...]), ..."
+RSPAMD_TASK_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) .*?rspamd_task_write_log: "
+    r".*?\bqid: <(?P<queue>[^>]+)>"
 )
+# Options are "{domain;policy;}" on allow, "{domain : reason;policy;}" on failures.
+RSPAMD_DMARC_RE = re.compile(r"\bDMARC_(?P<symbol>[A-Z_]+)\([-\d.]+\)\{(?P<options>[^}]*)\}")
+RSPAMD_DMARC_RESULTS = {
+    "POLICY_ALLOW": "pass",
+    "POLICY_ALLOW_WITH_FAILURES": "pass",
+    "POLICY_REJECT": "fail",
+    "POLICY_QUARANTINE": "fail",
+    "POLICY_SOFTFAIL": "fail",
+    "NA": "none",
+    "DNSFAIL": "temperror",
+    "BAD_POLICY": "permerror",
+}
 
 
 def _parse_syslog_ts(text: str, reference: datetime.datetime) -> datetime.datetime | None:
@@ -288,33 +302,66 @@ def parse_line(ts: datetime.datetime, rest: str, raw_line: str):
             "line_hash": _line_hash(raw_line),
         }
 
-    m = OPENDMARC_RESULT_RE.search(rest)
-    if m:
-        return "dmarc_results", {
-            "occurred_at": ts,
-            "queue_id": m["queue"],
-            "component": (m["mechanism"] or "dmarc").lower(),
-            "scope": m["scope"],
-            "domain": m["domain"],
-            "result": m["result"],
-            "raw_line": raw_line,
-            "line_hash": _line_hash(raw_line),
-        }
-
     return None, None
 
 
-def iter_log_lines(backfill: bool):
-    files = [MAIL_LOG_DIR / MAIL_LOG_BASENAME, MAIL_LOG_DIR / f"{MAIL_LOG_BASENAME}.1"]
+def parse_rspamd_line(raw_line: str):
+    m = RSPAMD_TASK_RE.match(raw_line)
+    if not m:
+        return None, None
+    # A line can carry more than one DMARC symbol, e.g. an option-less
+    # DMARC_POLICY_ALLOW_WITH_FAILURES{} next to DMARC_POLICY_ALLOW{domain;policy;}.
+    symbols = list(RSPAMD_DMARC_RE.finditer(raw_line))
+    if not symbols:
+        return None, None
+    results = [RSPAMD_DMARC_RESULTS.get(s["symbol"], s["symbol"].lower()) for s in symbols]
+    with_options = next((s for s in symbols if s["options"]), symbols[0])
+    options = [o for o in with_options["options"].split(";") if o]
+    domain = options[0].split(" : ")[0].strip() if options else None
+    return "dmarc_results", {
+        # Naive local time, same as the syslog timestamps.
+        "occurred_at": datetime.datetime.strptime(m["ts"], "%Y-%m-%d %H:%M:%S").astimezone(),
+        "queue_id": m["queue"],
+        "component": "dmarc",
+        "scope": options[1] if len(options) > 1 else None,
+        "domain": domain or None,
+        "result": "fail" if "fail" in results else results[0],
+        "raw_line": raw_line,
+        "line_hash": _line_hash(raw_line),
+    }
+
+
+def iter_log_lines(log_dir: Path, basename: str, backfill: bool):
+    files = [log_dir / basename, log_dir / f"{basename}.1"]
     if backfill:
-        files += sorted(MAIL_LOG_DIR.glob(f"{MAIL_LOG_BASENAME}.*.gz"))
+        files += sorted(log_dir.glob(f"{basename}.*.gz"))
 
     for path in files:
-        if not path.exists():
-            continue
         opener = gzip.open if path.suffix == ".gz" else open
-        with opener(path, "rt", errors="replace") as f:
+        try:
+            f = opener(path, "rt", errors="replace")
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            logger.warning("Cannot read %s, skipping", path)
+            continue
+        with f:
             yield from f
+
+
+def iter_parsed(backfill: bool, reference: datetime.datetime):
+    for raw_line in iter_log_lines(MAIL_LOG_DIR, MAIL_LOG_BASENAME, backfill):
+        raw_line = raw_line.rstrip("\n")
+        head = SYSLOG_TS_RE.match(raw_line)
+        if not head:
+            continue
+        ts = _parse_syslog_ts(head["ts"], reference)
+        if ts is None:
+            continue
+        yield parse_line(ts, head["rest"], raw_line)
+
+    for raw_line in iter_log_lines(RSPAMD_LOG_DIR, RSPAMD_LOG_BASENAME, backfill):
+        yield parse_rspamd_line(raw_line.rstrip("\n"))
 
 
 def get_connection() -> psycopg2.extensions.connection:
@@ -397,15 +444,7 @@ def main() -> int:
     try:
         ensure_schema(conn)
         with conn.cursor() as cur:
-            for raw_line in iter_log_lines(backfill=args.backfill):
-                raw_line = raw_line.rstrip("\n")
-                head = SYSLOG_TS_RE.match(raw_line)
-                if not head:
-                    continue
-                ts = _parse_syslog_ts(head["ts"], reference)
-                if ts is None:
-                    continue
-                table, row = parse_line(ts, head["rest"], raw_line)
+            for table, row in iter_parsed(args.backfill, reference):
                 if table is None:
                     continue
                 cur.execute(INSERT_SQL[table], row)

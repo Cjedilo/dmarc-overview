@@ -6,13 +6,13 @@
         {{ totals.get('rejects_received', 0) }} rejects received,
         {{ totals.get('dmarc_dkim_marked', 0) }} incoming mail marked (not rejected) for DMARC/DKIM
         <br><span style="font-size: 0.8rem; color: #666;">
-            From this mail server's own logs (Postfix/Dovecot/OpenDMARC on coador), not DMARC reports.
+            From this mail server's own logs (Postfix/Dovecot/rspamd on coador), not DMARC reports.
         </span>
     </p>
 
     <h2 style="font-size: 1.1rem;">Incoming mail marked for DMARC/DKIM, not rejected, by source IP</h2>
     <p class="summary">
-        OpenDMARC's RejectFailures is off, so these messages were delivered anyway &ndash; this is who's sending them.
+        rspamd only marks DMARC failures (all actions are disabled), so these messages were delivered anyway &ndash; this is who's sending them.
     </p>
     <table>
         <thead>
