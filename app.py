@@ -2,6 +2,7 @@ import datetime
 import functools
 import math
 import os
+import re
 
 import dns.exception
 import dns.resolver
@@ -60,6 +61,13 @@ MAILSEC_DB_USER = os.environ.get("MAILSEC_DB_USER", "mailsec")
 MAILSEC_DB_PASSWORD = os.environ["MAILSEC_DB_PASSWORD"]
 
 MONITORED_DOMAIN = os.environ.get("MONITORED_DOMAIN", "appelo.nl")
+# Fixed "Gebruiker X" letters for known users on the security page, e.g.
+# "bas@appelo.nl=B,cecile@appelo.nl=C". Everyone else gets the next free letter.
+FIXED_PSEUDONYMS = dict(
+    pair.strip().lower().rsplit("=", 1)
+    for pair in os.environ.get("FIXED_PSEUDONYMS", "").split(",")
+    if "=" in pair
+)
 
 
 def _txt_records(name):
@@ -595,6 +603,79 @@ def _country_for_ip(ip):
         return None
 
 
+EMAIL_RE = re.compile(r"[\w.+=-]+@[\w-]+(?:\.[\w-]+)+")
+# Forwarding/SRS-style addresses embed the original address at the end of
+# their local part: colander+caf_=bas=appelo.nl@gmail.com is Gmail's address
+# for mail forwarded from bas@appelo.nl.
+EMBEDDED_ADDRESS_RE = re.compile(r"([^-+=_]+)=([\w-]+(?:\.[\w-]+)+)$")
+
+
+def _is_own_domain(domain):
+    return domain == MONITORED_DOMAIN or domain.endswith("." + MONITORED_DOMAIN)
+
+
+def _own_address(address):
+    """(own address, via) for the @MONITORED_DOMAIN address behind `address`:
+    itself (via None), or the one a forwarding address embeds (via is the
+    forwarder's name, e.g. "gmail"). (None, None) if it isn't one of ours."""
+    local, _, domain = address.lower().rpartition("@")
+    m = EMBEDDED_ADDRESS_RE.search(local)
+    if m and _is_own_domain(m[2]):
+        return f"{m[1]}@{m[2]}", domain.split(".")[-2] if "." in domain else domain
+    if _is_own_domain(domain):
+        return f"{local}@{domain}", None
+    return None, None
+
+
+def _letters(n):
+    # 0 -> A, 25 -> Z, 26 -> AA, like spreadsheet columns.
+    out = ""
+    n += 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
+
+
+class AddressPseudonyms:
+    """Replaces our own users' addresses on the (public) security page with
+    "Gebruiker A", "Gebruiker B", ... Letters are handed out in order of first
+    appearance in the mailsec tables, so they stay the same between page loads.
+    """
+
+    def __init__(self, cur):
+        self.labels = {address: f"Gebruiker {letters.upper()}" for address, letters in FIXED_PSEUDONYMS.items()}
+        self.next_index = 0
+        cur.execute(
+            """
+            SELECT occurred_at, mail_from AS a, rcpt_to AS b, reason FROM mailsec.rejects_given
+            UNION ALL
+            SELECT occurred_at, orig_to, mail_to, reason FROM mailsec.rejects_received
+            ORDER BY occurred_at
+            """
+        )
+        for r in cur.fetchall():
+            for value in (r["a"], r["b"], r["reason"]):
+                self.mask(value)
+
+    def label(self, address):
+        own, via = _own_address(address)
+        if own is None:
+            return None
+        if own not in self.labels:
+            taken = set(self.labels.values())
+            while f"Gebruiker {_letters(self.next_index)}" in taken:
+                self.next_index += 1
+            self.labels[own] = f"Gebruiker {_letters(self.next_index)}"
+            self.next_index += 1
+        return f"{self.labels[own]} (via {via})" if via else self.labels[own]
+
+    def mask(self, text):
+        if not text:
+            return text
+        return EMAIL_RE.sub(lambda m: self.label(m[0]) or m[0], text)
+
+
 @app.route("/security")
 def security():
     conn = get_connection()
@@ -661,6 +742,19 @@ def security():
                 """
             )
             rejects_received = cur.fetchall()
+
+            pseudonyms = AddressPseudonyms(cur)
+            for r in rejects_given:
+                for key in ("mail_from", "rcpt_to", "reason"):
+                    r[key] = pseudonyms.mask(r[key])
+            for r in rejects_received:
+                # Forwarded mail: the destination is the user's own private
+                # address elsewhere (e.g. their Gmail), so hide that too.
+                if r["orig_to"] and r["mail_to"] and pseudonyms.label(r["orig_to"]) \
+                        and not pseudonyms.label(r["mail_to"]):
+                    r["mail_to"] = f"{pseudonyms.label(r['orig_to'])} (forward)"
+                for key in ("mail_to", "orig_to", "reason"):
+                    r[key] = pseudonyms.mask(r[key])
 
             cur.execute(
                 """
