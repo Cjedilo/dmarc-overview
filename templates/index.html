@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import pager as pagination %}
 {% block content %}
     {% set pct = (100 * summary.aligned_messages / summary.total_messages) | round(1) if summary.total_messages else None %}
     <div class="stats">
@@ -48,17 +49,5 @@
     </table>
     </div>
 
-    <p class="pagination">
-        {% if page > 1 %}
-            <a href="{{ url_for('index', page=page - 1) }}">&laquo; Previous</a>
-        {% else %}
-            <span class="disabled">&laquo; Previous</span>
-        {% endif %}
-        Page {{ page }} of {{ total_pages }}
-        {% if page < total_pages %}
-            <a href="{{ url_for('index', page=page + 1) }}">Next &raquo;</a>
-        {% else %}
-            <span class="disabled">Next &raquo;</span>
-        {% endif %}
-    </p>
+    {{ pagination(pager) }}
 {% endblock %}

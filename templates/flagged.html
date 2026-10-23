@@ -1,6 +1,7 @@
 {% extends "base.html" %}
+{% from "_macros.html" import pager as pagination %}
 {% block content %}
-    <p class="summary">{{ flagged_records | length }} non-DMARC-aligned messages (latest 200)</p>
+    <p class="summary">{{ pager.total }} report rows with non-DMARC-aligned mail, newest first</p>
 
     <div class="table-wrap">
     <table>
@@ -39,4 +40,5 @@
         </tbody>
     </table>
     </div>
+    {{ pagination(pager) }}
 {% endblock %}

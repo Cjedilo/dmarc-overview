@@ -1,0 +1,23 @@
+{# Page navigation under a table, for a pager dict from app.py's _paginated().
+   `anchor` makes the links jump back to that table on pages with several. #}
+{% macro pager(p, anchor=None) %}
+    {% if p.total_pages > 1 %}
+    <p class="pagination">
+        {% if p.page > 1 %}
+            <a href="{{ url_with(p.param, 1, anchor) }}" aria-label="First page">&laquo;</a>
+            <a href="{{ url_with(p.param, p.page - 1, anchor) }}">&lsaquo; Previous</a>
+        {% else %}
+            <span class="disabled">&laquo;</span>
+            <span class="disabled">&lsaquo; Previous</span>
+        {% endif %}
+        <span>{{ p.first }}&ndash;{{ p.last }} of {{ p.total }}</span>
+        {% if p.page < p.total_pages %}
+            <a href="{{ url_with(p.param, p.page + 1, anchor) }}">Next &rsaquo;</a>
+            <a href="{{ url_with(p.param, p.total_pages, anchor) }}" aria-label="Last page">&raquo;</a>
+        {% else %}
+            <span class="disabled">Next &rsaquo;</span>
+            <span class="disabled">&raquo;</span>
+        {% endif %}
+    </p>
+    {% endif %}
+{% endmacro %}

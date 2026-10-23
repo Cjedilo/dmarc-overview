@@ -11,7 +11,7 @@ import dns.reversename
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, url_for
 
 load_dotenv()
 
@@ -349,12 +349,76 @@ def pct_status(pct):
     return "bad"
 
 
-REPORTS_PER_PAGE = 50
+ROWS_PER_PAGE = 50
+
+# Period filter shared by every table page (not /trend, which has its own
+# month/day navigation). Key -> (label, days back; None = everything).
+PERIODS = {
+    "7d": ("Last 7 days", 7),
+    "30d": ("Last 30 days", 30),
+    "365d": ("Last 12 months", 365),
+    "all": ("All time", None),
+}
+DEFAULT_PERIOD = "30d"
+
+
+@app.context_processor
+def inject_periods():
+    return {"periods": PERIODS}
+
+
+def _period_from_request():
+    """(period key, start of that period, or None for all time)."""
+    key = request.args.get("period", DEFAULT_PERIOD)
+    if key not in PERIODS:
+        key = DEFAULT_PERIOD
+    days = PERIODS[key][1]
+    if days is None:
+        return key, None
+    return key, datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+
+
+def _since(column):
+    # SQL condition for the period filter; expects a %(since)s parameter.
+    return f"(%(since)s::timestamptz IS NULL OR {column} >= %(since)s)"
+
+
+def _paginated(cur, sql, params, page_param="page"):
+    """Runs `sql` (dict params, no LIMIT/OFFSET of its own) for the page number
+    in request arg `page_param`. Returns (rows, pager); pager is what the
+    pager() macro in _macros.html needs."""
+    cur.execute(f"SELECT count(*) AS n FROM ({sql}) t", params)
+    total = cur.fetchone()["n"]
+    total_pages = max(1, math.ceil(total / ROWS_PER_PAGE))
+    page = min(max(1, request.args.get(page_param, 1, type=int)), total_pages)
+    cur.execute(
+        f"{sql} LIMIT %(_limit)s OFFSET %(_offset)s",
+        {**params, "_limit": ROWS_PER_PAGE, "_offset": (page - 1) * ROWS_PER_PAGE},
+    )
+    pager = {
+        "param": page_param,
+        "page": page,
+        "total_pages": total_pages,
+        "total": total,
+        "first": (page - 1) * ROWS_PER_PAGE + 1 if total else 0,
+        "last": min(page * ROWS_PER_PAGE, total),
+    }
+    return cur.fetchall(), pager
+
+
+@app.template_global()
+def url_with(param, value, anchor=None):
+    """The current page's URL with one query arg changed (e.g. a page number),
+    keeping the others (period, other tables' page numbers)."""
+    args = request.args.to_dict()
+    args[param] = value
+    return url_for(request.endpoint, _anchor=anchor, **args)
 
 
 @app.route("/")
 def index():
-    page = max(1, request.args.get("page", 1, type=int))
+    period, since = _period_from_request()
+    params = {"since": since}
 
     conn = get_connection()
     try:
@@ -362,22 +426,22 @@ def index():
             domain_status = get_domain_overview(cur)
 
             cur.execute(
-                """
+                f"""
                 SELECT
                     count(DISTINCT ar.id) AS total_reports,
                     coalesce(sum(rec.count), 0) AS total_messages,
                     coalesce(sum(rec.count) FILTER (WHERE rec.dmarc_aligned), 0) AS aligned_messages
                 FROM dmarc.aggregate_reports ar
                 LEFT JOIN dmarc.aggregate_records rec ON rec.report_id = ar.id
-                """
+                WHERE {_since("ar.date_begin")}
+                """,
+                params,
             )
             summary = cur.fetchone()
 
-            total_pages = max(1, math.ceil(summary["total_reports"] / REPORTS_PER_PAGE))
-            page = min(page, total_pages)
-
-            cur.execute(
-                """
+            reports, pager = _paginated(
+                cur,
+                f"""
                 SELECT
                     ar.org_name,
                     ar.domain,
@@ -389,36 +453,38 @@ def index():
                     coalesce(sum(rec.count) FILTER (WHERE rec.disposition = 'reject'), 0) AS rejected_count
                 FROM dmarc.aggregate_reports ar
                 LEFT JOIN dmarc.aggregate_records rec ON rec.report_id = ar.id
+                WHERE {_since("ar.date_begin")}
                 GROUP BY ar.id
-                ORDER BY ar.date_begin DESC
-                LIMIT %s OFFSET %s
+                ORDER BY ar.date_begin DESC, ar.id DESC
                 """,
-                (REPORTS_PER_PAGE, (page - 1) * REPORTS_PER_PAGE),
+                params,
             )
-            reports = cur.fetchall()
     finally:
         conn.close()
 
     return render_template(
         "index.html",
         active_page="data",
+        period=period,
         domain_status=domain_status,
         summary=summary,
         reports=reports,
-        page=page,
-        total_pages=total_pages,
+        pager=pager,
     )
 
 
 @app.route("/flagged")
 def flagged():
+    period, since = _period_from_request()
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             domain_status = get_domain_overview(cur)
 
-            cur.execute(
-                """
+            flagged_records, pager = _paginated(
+                cur,
+                f"""
                 SELECT
                     ar.org_name,
                     rec.source_ip,
@@ -443,12 +509,11 @@ def flagged():
                     ) AS override_reason
                 FROM dmarc.aggregate_records rec
                 JOIN dmarc.aggregate_reports ar ON ar.id = rec.report_id
-                WHERE NOT rec.dmarc_aligned
-                ORDER BY rec.interval_begin DESC
-                LIMIT 200
-                """
+                WHERE NOT rec.dmarc_aligned AND {_since("rec.interval_begin")}
+                ORDER BY rec.interval_begin DESC, rec.id DESC
+                """,
+                {"since": since},
             )
-            flagged_records = cur.fetchall()
             for record in flagged_records:
                 record["reason"] = explain_failure(record)
                 record["flag"] = _country_flag(record["source_country"])
@@ -458,8 +523,10 @@ def flagged():
     return render_template(
         "flagged.html",
         active_page="flagged",
+        period=period,
         domain_status=domain_status,
         flagged_records=flagged_records,
+        pager=pager,
     )
 
 
@@ -614,13 +681,16 @@ def trend():
 
 @app.route("/sources")
 def sources():
+    period, since = _period_from_request()
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             domain_status = get_domain_overview(cur)
 
-            cur.execute(
-                """
+            source_rows, pager = _paginated(
+                cur,
+                f"""
                 SELECT
                     source_ip,
                     max(source_country) AS source_country,
@@ -639,12 +709,12 @@ def sources():
                     min(interval_begin) AS first_seen,
                     max(interval_begin) AS last_seen
                 FROM dmarc.aggregate_records
+                WHERE {_since("interval_begin")}
                 GROUP BY source_ip
-                ORDER BY total DESC
-                LIMIT 50
-                """
+                ORDER BY total DESC, source_ip
+                """,
+                {"since": since},
             )
-            source_rows = cur.fetchall()
     finally:
         conn.close()
 
@@ -655,8 +725,10 @@ def sources():
     return render_template(
         "sources.html",
         active_page="sources",
+        period=period,
         domain_status=domain_status,
         source_rows=source_rows,
+        pager=pager,
     )
 
 
@@ -784,8 +856,19 @@ class AddressPseudonyms:
 _pseudonyms = AddressPseudonyms()
 
 
+def _add_ip_details(rows):
+    for r in rows:
+        ip = str(r["source_ip"]) if r["source_ip"] else None
+        r["country"] = _country_for_ip(ip) if ip else None
+        r["flag"] = _country_flag(r["country"])
+        r["reverse_dns"] = _reverse_dns(ip) if ip else None
+
+
 @app.route("/security")
 def security():
+    period, since = _period_from_request()
+    params = {"since": since}
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -797,18 +880,23 @@ def security():
     try:
         with mailsec_conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT 'auth_failures' AS tbl, count(*) AS n FROM mailsec.auth_failures
+                    WHERE {_since("occurred_at")}
                 UNION ALL SELECT 'rejects_given', count(*) FROM mailsec.rejects_given
+                    WHERE {_since("occurred_at")}
                 UNION ALL SELECT 'rejects_received', count(*) FROM mailsec.rejects_received
+                    WHERE {_since("occurred_at")}
                 UNION ALL SELECT 'dmarc_dkim_marked', count(*) FROM mailsec.dmarc_results
-                    WHERE component = 'dmarc' AND result = 'fail'
-                """
+                    WHERE component = 'dmarc' AND result = 'fail' AND {_since("occurred_at")}
+                """,
+                params,
             )
             totals = {r["tbl"]: r["n"] for r in cur.fetchall()}
 
-            cur.execute(
-                """
+            auth_sources, auth_pager = _paginated(
+                cur,
+                f"""
                 SELECT
                     source_ip,
                     count(*) AS attempts,
@@ -817,39 +905,41 @@ def security():
                     min(occurred_at) AS first_seen,
                     max(occurred_at) AS last_seen
                 FROM mailsec.auth_failures
+                WHERE {_since("occurred_at")}
                 GROUP BY source_ip
-                ORDER BY attempts DESC
-                LIMIT 30
-                """
+                ORDER BY attempts DESC, source_ip
+                """,
+                params,
+                page_param="auth_page",
             )
-            auth_sources = cur.fetchall()
             for r in auth_sources:
                 r["services"] = ", ".join(AUTH_SERVICE_LABELS.get(s, s) for s in r["services"])
-                ip = str(r["source_ip"])
-                r["country"] = _country_for_ip(ip)
-                r["flag"] = _country_flag(r["country"])
-                r["reverse_dns"] = _reverse_dns(ip)
+            _add_ip_details(auth_sources)
 
-            cur.execute(
-                """
+            rejects_given, given_pager = _paginated(
+                cur,
+                f"""
                 SELECT occurred_at, source_ip, source_host, smtp_code, enhanced_code,
                        reason, mail_from, rcpt_to, helo
                 FROM mailsec.rejects_given
-                ORDER BY occurred_at DESC
-                LIMIT 200
-                """
+                WHERE {_since("occurred_at")}
+                ORDER BY occurred_at DESC, id DESC
+                """,
+                params,
+                page_param="given_page",
             )
-            rejects_given = cur.fetchall()
 
-            cur.execute(
-                """
+            rejects_received, received_pager = _paginated(
+                cur,
+                f"""
                 SELECT occurred_at, mail_to, orig_to, relay, dsn_code, reason
                 FROM mailsec.rejects_received
-                ORDER BY occurred_at DESC
-                LIMIT 200
-                """
+                WHERE {_since("occurred_at")}
+                ORDER BY occurred_at DESC, id DESC
+                """,
+                params,
+                page_param="received_page",
             )
-            rejects_received = cur.fetchall()
 
             pseudonyms = _pseudonyms
             pseudonyms.refresh(cur)
@@ -865,8 +955,9 @@ def security():
                 for key in ("mail_to", "orig_to", "reason"):
                     r[key] = pseudonyms.mask(r[key])
 
-            cur.execute(
-                """
+            dmarc_fail_sources, marked_pager = _paginated(
+                cur,
+                f"""
                 SELECT
                     c.source_ip,
                     count(*) AS total,
@@ -881,42 +972,46 @@ def security():
                     ORDER BY abs(extract(epoch FROM sc.occurred_at - d.occurred_at))
                     LIMIT 1
                 ) c ON true
-                WHERE d.component = 'dmarc' AND d.result = 'fail'
+                WHERE d.component = 'dmarc' AND d.result = 'fail' AND {_since("d.occurred_at")}
                 GROUP BY c.source_ip
-                ORDER BY total DESC
-                LIMIT 50
-                """
+                ORDER BY total DESC, c.source_ip
+                """,
+                params,
+                page_param="marked_page",
             )
-            dmarc_fail_sources = cur.fetchall()
-            for r in dmarc_fail_sources:
-                ip = str(r["source_ip"]) if r["source_ip"] else None
-                r["country"] = _country_for_ip(ip) if ip else None
-                r["flag"] = _country_flag(r["country"])
-                r["reverse_dns"] = _reverse_dns(ip) if ip else None
+            _add_ip_details(dmarc_fail_sources)
     finally:
         mailsec_conn.close()
 
     return render_template(
         "security.html",
         active_page="security",
+        period=period,
         domain_status=domain_status,
         totals=totals,
         auth_sources=auth_sources,
+        auth_pager=auth_pager,
         rejects_given=rejects_given,
+        given_pager=given_pager,
         rejects_received=rejects_received,
+        received_pager=received_pager,
         dmarc_fail_sources=dmarc_fail_sources,
+        marked_pager=marked_pager,
     )
 
 
 @app.route("/tls")
 def tls_reports():
+    period, since = _period_from_request()
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             domain_status = get_domain_overview(cur)
 
-            cur.execute(
-                """
+            policy_rows, pager = _paginated(
+                cur,
+                f"""
                 SELECT
                     r.organization_name,
                     r.date_begin,
@@ -940,11 +1035,11 @@ def tls_reports():
                     ) AS failure_summary
                 FROM dmarc.smtp_tls_policies p
                 JOIN dmarc.smtp_tls_reports r ON r.id = p.report_id
-                ORDER BY r.date_end DESC, r.organization_name
-                LIMIT 200
-                """
+                WHERE {_since("r.date_end")}
+                ORDER BY r.date_end DESC, r.organization_name, p.id
+                """,
+                {"since": since},
             )
-            policy_rows = cur.fetchall()
     finally:
         conn.close()
 
@@ -956,8 +1051,10 @@ def tls_reports():
     return render_template(
         "tls.html",
         active_page="tls",
+        period=period,
         domain_status=domain_status,
         policy_rows=policy_rows,
+        pager=pager,
     )
 
 

@@ -130,6 +130,14 @@
         .stat.warn .value { color: var(--warn); }
         .stat.bad .value { color: var(--bad); }
 
+        .period-picker { display: inline-flex; flex-wrap: wrap; gap: 0.25rem; margin-bottom: 1.25rem; padding: 0.25rem;
+                         background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+                         box-shadow: var(--shadow); }
+        .period-picker a { padding: 0.3rem 0.8rem; border-radius: 6px; text-decoration: none; font-size: 0.88rem;
+                           color: var(--text-secondary); }
+        .period-picker a:hover { background: var(--surface-2); color: var(--text); }
+        .period-picker a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
         .pagination { margin-top: 1rem; display: flex; align-items: center; justify-content: center; gap: 1rem;
                       color: var(--text-secondary); font-size: 0.9rem; }
         .pagination a, .pagination .disabled { padding: 0.35rem 0.8rem; border-radius: 7px;
@@ -214,16 +222,25 @@
         </div>
     </div>
 
+    {% set keep_period = {'period': period} if period else {} %}
     <div class="layout">
         <nav>
-            <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'data' else '' }}"><span class="icon" aria-hidden="true">📥</span>Received reports</a>
-            <a href="{{ url_for('flagged') }}" class="{{ 'active' if active_page == 'flagged' else '' }}"><span class="icon" aria-hidden="true">🚩</span>Flagged mail</a>
+            <a href="{{ url_for('index', **keep_period) }}" class="{{ 'active' if active_page == 'data' else '' }}"><span class="icon" aria-hidden="true">📥</span>Received reports</a>
+            <a href="{{ url_for('flagged', **keep_period) }}" class="{{ 'active' if active_page == 'flagged' else '' }}"><span class="icon" aria-hidden="true">🚩</span>Flagged mail</a>
             <a href="{{ url_for('trend') }}" class="{{ 'active' if active_page == 'trend' else '' }}"><span class="icon" aria-hidden="true">📊</span>Volume over time</a>
-            <a href="{{ url_for('sources') }}" class="{{ 'active' if active_page == 'sources' else '' }}"><span class="icon" aria-hidden="true">🌐</span>Top sources</a>
-            <a href="{{ url_for('tls_reports') }}" class="{{ 'active' if active_page == 'tls' else '' }}"><span class="icon" aria-hidden="true">🔒</span>TLS reports</a>
-            <a href="{{ url_for('security') }}" class="{{ 'active' if active_page == 'security' else '' }}"><span class="icon" aria-hidden="true">🛡️</span>Mail security</a>
+            <a href="{{ url_for('sources', **keep_period) }}" class="{{ 'active' if active_page == 'sources' else '' }}"><span class="icon" aria-hidden="true">🌐</span>Top sources</a>
+            <a href="{{ url_for('tls_reports', **keep_period) }}" class="{{ 'active' if active_page == 'tls' else '' }}"><span class="icon" aria-hidden="true">🔒</span>TLS reports</a>
+            <a href="{{ url_for('security', **keep_period) }}" class="{{ 'active' if active_page == 'security' else '' }}"><span class="icon" aria-hidden="true">🛡️</span>Mail security</a>
         </nav>
         <main>
+            {% if period %}
+            <div class="period-picker" role="group" aria-label="Period">
+                {% for key, (label, _) in periods.items() %}
+                <a href="{{ url_for(request.endpoint, period=key) }}" class="{{ 'active' if key == period else '' }}"
+                   {% if key == period %}aria-current="true"{% endif %}>{{ label }}</a>
+                {% endfor %}
+            </div>
+            {% endif %}
             {% block content %}{% endblock %}
         </main>
     </div>
