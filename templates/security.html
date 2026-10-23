@@ -1,26 +1,37 @@
 {% extends "base.html" %}
 {% block content %}
-    <p class="summary">
-        {{ totals.get('auth_failures', 0) }} failed login attempts,
-        {{ totals.get('rejects_given', 0) }} rejects given,
-        {{ totals.get('rejects_received', 0) }} rejects received,
-        {{ totals.get('dmarc_dkim_marked', 0) }} incoming mail marked (not rejected) for DMARC/DKIM
-        <br><span style="font-size: 0.8rem; color: #666;">
-            From this mail server's own logs (Postfix/Dovecot/rspamd on coador), not DMARC reports.
-        </span>
-    </p>
+    <div class="stats">
+        <div class="stat {{ 'bad' if totals.get('auth_failures', 0) else 'good' }}">
+            <div class="label">Failed logins</div>
+            <div class="value">{{ totals.get('auth_failures', 0) }}</div>
+        </div>
+        <div class="stat">
+            <div class="label">Rejects given</div>
+            <div class="value">{{ totals.get('rejects_given', 0) }}</div>
+        </div>
+        <div class="stat {{ 'warn' if totals.get('rejects_received', 0) else 'good' }}">
+            <div class="label">Rejects received</div>
+            <div class="value">{{ totals.get('rejects_received', 0) }}</div>
+        </div>
+        <div class="stat {{ 'warn' if totals.get('dmarc_dkim_marked', 0) else 'good' }}">
+            <div class="label">Marked for DMARC/DKIM</div>
+            <div class="value">{{ totals.get('dmarc_dkim_marked', 0) }}</div>
+        </div>
+    </div>
+    <p class="note">From this mail server's own logs (Postfix/Dovecot/rspamd on coador), not DMARC reports.</p>
 
-    <h2 style="font-size: 1.1rem;">Incoming mail marked for DMARC/DKIM, not rejected, by source IP</h2>
+    <h2>Incoming mail marked for DMARC/DKIM, not rejected, by source IP</h2>
     <p class="summary">
         rspamd only marks DMARC failures (all actions are disabled), so these messages were delivered anyway &ndash; this is who's sending them.
     </p>
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
                 <th>Source IP</th>
                 <th>Country</th>
                 <th>Reverse DNS</th>
-                <th>Marked</th>
+                <th class="num">Marked</th>
                 <th>Claimed domain(s)</th>
                 <th>First seen</th>
                 <th>Last seen</th>
@@ -29,30 +40,32 @@
         <tbody>
             {% for r in dmarc_fail_sources %}
             <tr>
-                <td>{{ r.source_ip or '-' }}</td>
-                <td>{{ r.flag }} {{ r.country or '-' }}</td>
+                <td class="mono">{{ r.source_ip or '-' }}</td>
+                <td class="nowrap">{{ r.flag }} {{ r.country or '-' }}</td>
                 <td>{{ r.reverse_dns or '-' }}</td>
-                <td>{{ r.total }}</td>
+                <td class="num">{{ r.total }}</td>
                 <td>{{ r.domains | join(', ') }}</td>
-                <td>{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
-                <td>{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td class="nowrap">{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td class="nowrap">{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
             </tr>
             {% endfor %}
             {% if not dmarc_fail_sources %}
-            <tr><td colspan="7"><em>None yet.</em></td></tr>
+            <tr><td colspan="7" class="empty">None yet.</td></tr>
             {% endif %}
         </tbody>
     </table>
+    </div>
 
-    <h2 style="font-size: 1.1rem; margin-top: 2rem;">Failed login attempts, by source IP</h2>
+    <h2>Failed login attempts, by source IP</h2>
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
                 <th>Source IP</th>
                 <th>Country</th>
                 <th>Reverse DNS</th>
-                <th>Attempts</th>
-                <th>Usernames tried</th>
+                <th class="num">Attempts</th>
+                <th class="num">Usernames tried</th>
                 <th>Services</th>
                 <th>First seen</th>
                 <th>Last seen</th>
@@ -61,21 +74,26 @@
         <tbody>
             {% for r in auth_sources %}
             <tr>
-                <td>{{ r.source_ip }}</td>
-                <td>{{ r.flag }} {{ r.country or '-' }}</td>
+                <td class="mono">{{ r.source_ip }}</td>
+                <td class="nowrap">{{ r.flag }} {{ r.country or '-' }}</td>
                 <td>{{ r.reverse_dns or '-' }}</td>
-                <td>{{ r.attempts }}</td>
-                <td>{{ r.distinct_usernames }}</td>
+                <td class="num">{{ r.attempts }}</td>
+                <td class="num">{{ r.distinct_usernames }}</td>
                 <td>{{ r.services }}</td>
-                <td>{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
-                <td>{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td class="nowrap">{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td class="nowrap">{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
             </tr>
             {% endfor %}
+            {% if not auth_sources %}
+            <tr><td colspan="8" class="empty">None.</td></tr>
+            {% endif %}
         </tbody>
     </table>
+    </div>
 
-    <h2 style="font-size: 1.1rem; margin-top: 2rem;">Rejects given (incoming mail we refused)</h2>
+    <h2>Rejects given (incoming mail we refused)</h2>
     <p class="summary">Latest {{ rejects_given | length }}</p>
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
@@ -91,20 +109,25 @@
         <tbody>
             {% for r in rejects_given %}
             <tr>
-                <td>{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
-                <td>{{ r.source_host }} [{{ r.source_ip }}]</td>
-                <td>{{ (r.smtp_code ~ ' ' if r.smtp_code) }}{{ r.enhanced_code or '' }}</td>
+                <td class="nowrap">{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td>{{ r.source_host }} <span class="mono">[{{ r.source_ip }}]</span></td>
+                <td class="nowrap"><span class="badge bad">{{ (r.smtp_code ~ ' ' if r.smtp_code) }}{{ r.enhanced_code or '' }}</span></td>
                 <td class="reason">{{ r.reason }}</td>
                 <td>{{ r.mail_from or '-' }}</td>
                 <td>{{ r.rcpt_to or '-' }}</td>
                 <td>{{ r.helo or '-' }}</td>
             </tr>
             {% endfor %}
+            {% if not rejects_given %}
+            <tr><td colspan="7" class="empty">None.</td></tr>
+            {% endif %}
         </tbody>
     </table>
+    </div>
 
-    <h2 style="font-size: 1.1rem; margin-top: 2rem;">Rejects received (our outbound mail refused elsewhere)</h2>
+    <h2>Rejects received (our outbound mail refused elsewhere)</h2>
     <p class="summary">Latest {{ rejects_received | length }}</p>
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
@@ -119,14 +142,18 @@
         <tbody>
             {% for r in rejects_received %}
             <tr>
-                <td>{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td class="nowrap">{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
                 <td>{{ r.mail_to }}</td>
                 <td>{{ r.orig_to or '-' }}</td>
                 <td>{{ r.relay }}</td>
-                <td>{{ r.dsn_code }}</td>
+                <td><span class="badge warn">{{ r.dsn_code }}</span></td>
                 <td class="reason">{{ r.reason }}</td>
             </tr>
             {% endfor %}
+            {% if not rejects_received %}
+            <tr><td colspan="6" class="empty">None.</td></tr>
+            {% endif %}
         </tbody>
     </table>
+    </div>
 {% endblock %}

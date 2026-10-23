@@ -2,6 +2,7 @@
 {% block content %}
     <p class="summary">{{ policy_rows | length }} TLS-RPT policy result(s) (latest 200)</p>
 
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
@@ -9,25 +10,29 @@
                 <th>Reporting organization</th>
                 <th>Policy domain</th>
                 <th>Policy type</th>
-                <th>Successful</th>
-                <th>Failed</th>
-                <th>Failure rate</th>
+                <th class="num">Successful</th>
+                <th class="num">Failed</th>
+                <th class="num">Failure rate</th>
                 <th>Failure details</th>
             </tr>
         </thead>
         <tbody>
             {% for r in policy_rows %}
             <tr>
-                <td>{{ r.date_end.strftime('%Y-%m-%d') }}</td>
+                <td class="nowrap">{{ r.date_end.strftime('%Y-%m-%d') }}</td>
                 <td>{{ r.organization_name }}</td>
                 <td>{{ r.policy_domain }}</td>
-                <td>{{ r.policy_type }}</td>
-                <td>{{ r.successful_session_count }}</td>
-                <td>{{ r.failed_session_count }}</td>
-                <td>{{ r.failure_rate_pct }}%</td>
+                <td><span class="badge">{{ r.policy_type }}</span></td>
+                <td class="num">{{ r.successful_session_count }}</td>
+                <td class="num">{{ r.failed_session_count }}</td>
+                <td class="num"><span class="badge {{ 'good' if r.failure_rate_pct == 0 else 'warn' if r.failure_rate_pct < 10 else 'bad' }}">{{ r.failure_rate_pct }}%</span></td>
                 <td class="reason">{{ r.failure_summary or '-' }}</td>
             </tr>
             {% endfor %}
+            {% if not policy_rows %}
+            <tr><td colspan="8" class="empty">No TLS reports yet.</td></tr>
+            {% endif %}
         </tbody>
     </table>
+    </div>
 {% endblock %}

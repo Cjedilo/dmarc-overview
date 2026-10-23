@@ -2,17 +2,18 @@
 {% block content %}
     <p class="summary">{{ source_rows | length }} distinct source IPs, by total volume</p>
 
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
                 <th>Source IP</th>
                 <th>Country</th>
                 <th>Reverse DNS</th>
-                <th>Total</th>
-                <th>Aligned</th>
-                <th>Aligned %</th>
-                <th>Quarantine</th>
-                <th>Reject</th>
+                <th class="num">Total</th>
+                <th class="num">Aligned</th>
+                <th class="num">Aligned %</th>
+                <th class="num">Quarantine</th>
+                <th class="num">Reject</th>
                 <th>First seen</th>
                 <th>Last seen</th>
             </tr>
@@ -20,18 +21,19 @@
         <tbody>
             {% for r in source_rows %}
             <tr>
-                <td>{{ r.source_ip }}</td>
-                <td>{{ r.flag }} {{ r.source_country or '-' }}</td>
+                <td class="mono">{{ r.source_ip }}</td>
+                <td class="nowrap">{{ r.flag }} {{ r.source_country or '-' }}</td>
                 <td>{{ r.source_reverse_dns or '-' }}</td>
-                <td>{{ r.total }}</td>
-                <td>{{ r.aligned }}</td>
-                <td>{{ r.aligned_pct }}%</td>
-                <td>{{ r.quarantine }}</td>
-                <td>{{ r.reject }}</td>
-                <td>{{ r.first_seen.strftime('%Y-%m-%d') }}</td>
-                <td>{{ r.last_seen.strftime('%Y-%m-%d') }}</td>
+                <td class="num">{{ r.total }}</td>
+                <td class="num">{{ r.aligned }}</td>
+                <td class="num"><span class="badge {{ 'good' if r.aligned_pct >= 95 else 'warn' if r.aligned_pct >= 50 else 'bad' }}">{{ r.aligned_pct }}%</span></td>
+                <td class="num">{{ r.quarantine }}</td>
+                <td class="num">{{ r.reject }}</td>
+                <td class="nowrap">{{ r.first_seen.strftime('%Y-%m-%d') }}</td>
+                <td class="nowrap">{{ r.last_seen.strftime('%Y-%m-%d') }}</td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
+    </div>
 {% endblock %}

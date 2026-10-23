@@ -1,24 +1,32 @@
 {% extends "base.html" %}
 {% block content %}
-    <p class="summary">
-        {{ summary.total_reports }} reports,
-        {{ summary.total_messages }} messages total,
-        {{ summary.aligned_messages }} DMARC-aligned
-        {% if summary.total_messages %}
-            ({{ (100 * summary.aligned_messages / summary.total_messages) | round(1) }}%)
-        {% endif %}
-    </p>
+    {% set pct = (100 * summary.aligned_messages / summary.total_messages) | round(1) if summary.total_messages else None %}
+    <div class="stats">
+        <div class="stat">
+            <div class="label">Reports</div>
+            <div class="value">{{ summary.total_reports }}</div>
+        </div>
+        <div class="stat">
+            <div class="label">Messages</div>
+            <div class="value">{{ summary.total_messages }}</div>
+        </div>
+        <div class="stat {{ 'good' if pct is not none and pct >= 95 else 'warn' if pct is not none and pct >= 80 else 'bad' if pct is not none else '' }}">
+            <div class="label">DMARC-aligned</div>
+            <div class="value">{{ summary.aligned_messages }}{% if pct is not none %} <small>{{ pct }}%</small>{% endif %}</div>
+        </div>
+    </div>
 
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
                 <th>Organization</th>
                 <th>Domain</th>
                 <th>Period</th>
-                <th>Messages</th>
-                <th>Aligned</th>
-                <th>Quarantine</th>
-                <th>Reject</th>
+                <th class="num">Messages</th>
+                <th class="num">Aligned</th>
+                <th class="num">Quarantine</th>
+                <th class="num">Reject</th>
             </tr>
         </thead>
         <tbody>
@@ -26,15 +34,19 @@
             <tr>
                 <td>{{ r.org_name }}</td>
                 <td>{{ r.domain }}</td>
-                <td>{{ r.date_begin.strftime('%Y-%m-%d') }} &ndash; {{ r.date_end.strftime('%Y-%m-%d') }}</td>
-                <td>{{ r.total_count }}</td>
-                <td>{{ r.aligned_count }}</td>
-                <td>{{ r.quarantined_count }}</td>
-                <td>{{ r.rejected_count }}</td>
+                <td class="nowrap">{{ r.date_begin.strftime('%Y-%m-%d') }} &ndash; {{ r.date_end.strftime('%Y-%m-%d') }}</td>
+                <td class="num">{{ r.total_count }}</td>
+                <td class="num">{{ r.aligned_count }}</td>
+                <td class="num">{% if r.quarantined_count %}<span class="badge warn">{{ r.quarantined_count }}</span>{% else %}0{% endif %}</td>
+                <td class="num">{% if r.rejected_count %}<span class="badge bad">{{ r.rejected_count }}</span>{% else %}0{% endif %}</td>
             </tr>
             {% endfor %}
+            {% if not reports %}
+            <tr><td colspan="7" class="empty">No reports yet.</td></tr>
+            {% endif %}
         </tbody>
     </table>
+    </div>
 
     <p class="pagination">
         {% if page > 1 %}

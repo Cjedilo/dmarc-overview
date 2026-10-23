@@ -2,6 +2,7 @@
 {% block content %}
     <p class="summary">{{ flagged_records | length }} non-DMARC-aligned messages (latest 200)</p>
 
+    <div class="table-wrap">
     <table>
         <thead>
             <tr>
@@ -11,7 +12,7 @@
                 <th>Country</th>
                 <th>Header-From</th>
                 <th>Envelope-From</th>
-                <th>Count</th>
+                <th class="num">Count</th>
                 <th>Outcome</th>
                 <th>Reason</th>
                 <th>Receiver's explanation</th>
@@ -20,18 +21,22 @@
         <tbody>
             {% for r in flagged_records %}
             <tr>
-                <td>{{ r.interval_begin.strftime('%Y-%m-%d') }}</td>
+                <td class="nowrap">{{ r.interval_begin.strftime('%Y-%m-%d') }}</td>
                 <td>{{ r.org_name }}</td>
-                <td>{{ r.source_ip }}</td>
-                <td>{{ r.flag }} {{ r.source_country or '-' }}</td>
+                <td class="mono">{{ r.source_ip }}</td>
+                <td class="nowrap">{{ r.flag }} {{ r.source_country or '-' }}</td>
                 <td>{{ r.header_from or '-' }}</td>
                 <td>{{ r.envelope_from or '-' }}</td>
-                <td>{{ r.count }}</td>
-                <td>{{ r.disposition }}</td>
+                <td class="num">{{ r.count }}</td>
+                <td><span class="badge {{ {'reject': 'bad', 'quarantine': 'warn'}.get(r.disposition, '') }}">{{ r.disposition }}</span></td>
                 <td class="reason">{{ r.reason }}</td>
                 <td class="reason">{{ r.override_reason or '-' }}</td>
             </tr>
             {% endfor %}
+            {% if not flagged_records %}
+            <tr><td colspan="10" class="empty">Nothing flagged. 🎉</td></tr>
+            {% endif %}
         </tbody>
     </table>
+    </div>
 {% endblock %}
