@@ -111,7 +111,7 @@
             <tr>
                 <td class="nowrap">{{ r.occurred_at.strftime('%Y-%m-%d %H:%M') }}</td>
                 <td>{{ r.source_host }} <span class="mono">[{{ r.source_ip }}]</span></td>
-                <td class="nowrap"><span class="badge bad">{{ (r.smtp_code ~ ' ' if r.smtp_code) }}{{ r.enhanced_code or '' }}</span></td>
+                <td class="nowrap">{% if r.smtp_code or r.enhanced_code %}<span class="badge bad">{{ (r.smtp_code ~ ' ' if r.smtp_code) }}{{ r.enhanced_code or '' }}</span>{% else %}-{% endif %}</td>
                 <td class="reason">{{ r.reason }}</td>
                 <td>{{ r.mail_from or '-' }}</td>
                 <td>{{ r.rcpt_to or '-' }}</td>
@@ -146,7 +146,7 @@
                 <td>{{ r.mail_to }}</td>
                 <td>{{ r.orig_to or '-' }}</td>
                 <td>{{ r.relay }}</td>
-                <td><span class="badge warn">{{ r.dsn_code }}</span></td>
+                <td>{% if r.dsn_code %}<span class="badge warn">{{ r.dsn_code }}</span>{% else %}-{% endif %}</td>
                 <td class="reason">{{ r.reason }}</td>
             </tr>
             {% endfor %}

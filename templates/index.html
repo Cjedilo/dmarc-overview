@@ -10,7 +10,7 @@
             <div class="label">Messages</div>
             <div class="value">{{ summary.total_messages }}</div>
         </div>
-        <div class="stat {{ 'good' if pct is not none and pct >= 95 else 'warn' if pct is not none and pct >= 80 else 'bad' if pct is not none else '' }}">
+        <div class="stat {{ pct | pct_status }}">
             <div class="label">DMARC-aligned</div>
             <div class="value">{{ summary.aligned_messages }}{% if pct is not none %} <small>{{ pct }}%</small>{% endif %}</div>
         </div>

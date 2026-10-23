@@ -12,6 +12,7 @@
                 <th class="num">Total</th>
                 <th class="num">Aligned</th>
                 <th class="num">Aligned %</th>
+                <th class="num">Let through</th>
                 <th class="num">Quarantine</th>
                 <th class="num">Reject</th>
                 <th>First seen</th>
@@ -26,13 +27,17 @@
                 <td>{{ r.source_reverse_dns or '-' }}</td>
                 <td class="num">{{ r.total }}</td>
                 <td class="num">{{ r.aligned }}</td>
-                <td class="num"><span class="badge {{ 'good' if r.aligned_pct >= 95 else 'warn' if r.aligned_pct >= 50 else 'bad' }}">{{ r.aligned_pct }}%</span></td>
+                <td class="num"><span class="badge {{ r.aligned_pct | pct_status }}">{{ r.aligned_pct }}%</span></td>
+                <td class="num">{{ r.let_through }}</td>
                 <td class="num">{{ r.quarantine }}</td>
                 <td class="num">{{ r.reject }}</td>
                 <td class="nowrap">{{ r.first_seen.strftime('%Y-%m-%d') }}</td>
                 <td class="nowrap">{{ r.last_seen.strftime('%Y-%m-%d') }}</td>
             </tr>
             {% endfor %}
+            {% if not source_rows %}
+            <tr><td colspan="11" class="empty">No sources yet.</td></tr>
+            {% endif %}
         </tbody>
     </table>
     </div>

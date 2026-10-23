@@ -45,6 +45,10 @@ DB_NAME = os.environ.get("DB_NAME", "dmarc")
 DB_USER = os.environ.get("DB_USER", "dmarc")
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
+# Only reports about this domain (or its subdomains) are stored. Anyone can
+# mail a report to the rua address, about any domain; those are skipped.
+MONITORED_DOMAIN = os.environ.get("MONITORED_DOMAIN", "appelo.nl").lower()
+
 # Set to "false" once the server (192.168.93.11) has outbound internet and you
 # want reverse-DNS/country enrichment of source IPs; otherwise those columns stay NULL.
 DMARC_OFFLINE = os.environ.get("DMARC_OFFLINE", "true").lower() != "false"
@@ -197,9 +201,24 @@ def _parse_naive_utc(timestamp: str) -> datetime:
     return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
+def _is_monitored(domain: str | None) -> bool:
+    domain = (domain or "").lower().rstrip(".")
+    return domain == MONITORED_DOMAIN or domain.endswith("." + MONITORED_DOMAIN)
+
+
 def store_aggregate_report(cur, report: AggregateReport, backfill: bool = False) -> None:
     metadata = report["report_metadata"]
     policy = report["policy_published"]
+
+    if not _is_monitored(policy["domain"]):
+        logger.warning(
+            "Skipping report %s from %s: it's about %s, not %s",
+            metadata["report_id"],
+            metadata["org_name"],
+            policy["domain"],
+            MONITORED_DOMAIN,
+        )
+        return
 
     if backfill:
         # Delete any existing report first (cascade cleans up records/dkim/spf/
@@ -326,6 +345,15 @@ def store_aggregate_report(cur, report: AggregateReport, backfill: bool = False)
 
 
 def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
+    if not any(_is_monitored(policy["policy_domain"]) for policy in report["policies"]):
+        logger.warning(
+            "Skipping TLS-RPT report %s from %s: no policy for %s",
+            report["report_id"],
+            report["organization_name"],
+            MONITORED_DOMAIN,
+        )
+        return
+
     contact_info = report["contact_info"]
     if isinstance(contact_info, list):
         contact_info = ", ".join(contact_info)
@@ -357,6 +385,8 @@ def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
     report_db_id = row[0]
 
     for policy in report["policies"]:
+        if not _is_monitored(policy["policy_domain"]):
+            continue
         cur.execute(
             """
             INSERT INTO dmarc.smtp_tls_policies
@@ -402,6 +432,9 @@ def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
 
 
 def store_failure_report_summary(cur, report: FailureReport) -> None:
+    if not _is_monitored(report["reported_domain"]):
+        logger.warning("Skipping failure report about %s, not %s", report["reported_domain"], MONITORED_DOMAIN)
+        return
     source = report["source"]
     cur.execute(
         """

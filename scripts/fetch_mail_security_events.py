@@ -439,6 +439,7 @@ def main() -> int:
         "dmarc_results": 0,
     }
     skipped = 0
+    failed = 0
 
     conn = get_connection()
     try:
@@ -447,8 +448,20 @@ def main() -> int:
             for table, row in iter_parsed(args.backfill, reference):
                 if table is None:
                     continue
-                cur.execute(INSERT_SQL[table], row)
-                if cur.rowcount:
+                # One bad line (e.g. a value Postgres won't accept) must not
+                # roll back the whole run: it would be re-read, and fail
+                # again, on every run until the log rotates away.
+                cur.execute("SAVEPOINT line")
+                try:
+                    cur.execute(INSERT_SQL[table], row)
+                    stored = cur.rowcount
+                except psycopg2.DataError:
+                    cur.execute("ROLLBACK TO SAVEPOINT line")
+                    logger.warning("Could not store line, skipping: %s", row["raw_line"])
+                    failed += 1
+                    continue
+                cur.execute("RELEASE SAVEPOINT line")
+                if stored:
                     counts[table] += 1
                 else:
                     skipped += 1
@@ -462,13 +475,14 @@ def main() -> int:
 
     logger.info(
         "Done: %d auth failures, %d rejects given, %d rejects received, "
-        "%d smtp clients, %d dmarc results stored (%d lines already seen, skipped)",
+        "%d smtp clients, %d dmarc results stored (%d lines already seen, skipped; %d failed)",
         counts["auth_failures"],
         counts["rejects_given"],
         counts["rejects_received"],
         counts["smtp_clients"],
         counts["dmarc_results"],
         skipped,
+        failed,
     )
     return 0
 

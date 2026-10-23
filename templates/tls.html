@@ -25,7 +25,7 @@
                 <td><span class="badge">{{ r.policy_type }}</span></td>
                 <td class="num">{{ r.successful_session_count }}</td>
                 <td class="num">{{ r.failed_session_count }}</td>
-                <td class="num"><span class="badge {{ 'good' if r.failure_rate_pct == 0 else 'warn' if r.failure_rate_pct < 10 else 'bad' }}">{{ r.failure_rate_pct }}%</span></td>
+                <td class="num"><span class="badge {{ 'good' if r.failed_session_count == 0 else 'warn' if r.failure_rate_pct < 10 else 'bad' }}">{{ r.failure_rate_pct }}%</span></td>
                 <td class="reason">{{ r.failure_summary or '-' }}</td>
             </tr>
             {% endfor %}

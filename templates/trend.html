@@ -3,8 +3,9 @@
 {% block extra_head %}
 <style>
     .viz-root {
-        --baseline: var(--border);
+        --baseline: var(--muted);
         --status-good: #22a35a;
+        --status-letthrough: #8a7fd6;
         --status-warning: #f2b233;
         --status-critical: #d94848;
     }
@@ -36,6 +37,7 @@
     .seg { width: var(--bar-width, 20px); border-radius: 4px 4px 0 0; transition: filter 0.15s; }
     .bar-stack:hover .seg, .bar-link:hover .seg { filter: brightness(1.12); }
     .seg-aligned { background: var(--status-good); }
+    .seg-letthrough { background: var(--status-letthrough); }
     .seg-quarantine { background: var(--status-warning); }
     .seg-reject { background: var(--status-critical); }
 
@@ -61,7 +63,7 @@
     .bar-link:focus { outline: 2px solid var(--status-good); outline-offset: 2px; }
     .bar-link.active .bar-stack { outline: 2px solid var(--text-secondary); outline-offset: 2px; }
 
-    .chart-tooltip { position: absolute; background: #0b0b0b; color: #fff; padding: 0.5rem 0.7rem;
+    .chart-tooltip { position: absolute; background: var(--text); color: var(--surface); padding: 0.5rem 0.7rem;
                       border-radius: 4px; font-size: 0.8rem; pointer-events: none; z-index: 10;
                       white-space: nowrap; }
     .chart-tooltip strong { display: block; margin-bottom: 0.2rem; }
@@ -81,6 +83,7 @@
 
         <div class="chart-legend">
             <span class="legend-item"><span class="swatch" style="background: var(--status-good)"></span>Aligned</span>
+            <span class="legend-item"><span class="swatch" style="background: var(--status-letthrough)"></span>Not aligned, let through</span>
             <span class="legend-item"><span class="swatch" style="background: var(--status-warning)"></span>Quarantine</span>
             <span class="legend-item"><span class="swatch" style="background: var(--status-critical)"></span>Reject</span>
         </div>
@@ -93,11 +96,12 @@
                 <div class="chart-bars">
                     {% for bar in day_bars %}
                     <div class="bar-stack" tabindex="0" role="img"
-                         aria-label="{{ bar.full_label }}: {{ bar.aligned }} aligned, {{ bar.quarantine }} quarantine, {{ bar.reject }} reject"
-                         data-label="{{ bar.full_label }}" data-aligned="{{ bar.aligned }}"
+                         aria-label="{{ bar.full_label }}: {{ bar.aligned }} aligned, {{ bar.let_through }} not aligned but let through, {{ bar.quarantine }} quarantine, {{ bar.reject }} reject"
+                         data-label="{{ bar.full_label }}" data-aligned="{{ bar.aligned }}" data-letthrough="{{ bar.let_through }}"
                          data-quarantine="{{ bar.quarantine }}" data-reject="{{ bar.reject }}">
                         <div class="seg seg-reject" style="height: {{ bar.reject_h }}px"></div>
                         <div class="seg seg-quarantine" style="height: {{ bar.quarantine_h }}px"></div>
+                        <div class="seg seg-letthrough" style="height: {{ bar.let_through_h }}px"></div>
                         <div class="seg seg-aligned" style="height: {{ bar.aligned_h }}px"></div>
                     </div>
                     {% endfor %}
@@ -111,16 +115,17 @@
         <button type="button" class="table-toggle" id="daily-table-toggle" aria-expanded="false">View as table</button>
         <table class="trend-table" id="daily-table" hidden>
             <thead>
-                <tr><th>Day</th><th>Aligned</th><th>Quarantine</th><th>Reject</th><th>Total</th></tr>
+                <tr><th>Day</th><th class="num">Aligned</th><th class="num">Let through</th><th class="num">Quarantine</th><th class="num">Reject</th><th class="num">Total</th></tr>
             </thead>
             <tbody>
                 {% for bar in day_bars %}
                 <tr>
                     <td>{{ bar.full_label }}</td>
-                    <td>{{ bar.aligned }}</td>
-                    <td>{{ bar.quarantine }}</td>
-                    <td>{{ bar.reject }}</td>
-                    <td>{{ bar.total }}</td>
+                    <td class="num">{{ bar.aligned }}</td>
+                    <td class="num">{{ bar.let_through }}</td>
+                    <td class="num">{{ bar.quarantine }}</td>
+                    <td class="num">{{ bar.reject }}</td>
+                    <td class="num">{{ bar.total }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -137,6 +142,7 @@
 
         <div class="chart-legend">
             <span class="legend-item"><span class="swatch" style="background: var(--status-good)"></span>Aligned</span>
+            <span class="legend-item"><span class="swatch" style="background: var(--status-letthrough)"></span>Not aligned, let through</span>
             <span class="legend-item"><span class="swatch" style="background: var(--status-warning)"></span>Quarantine</span>
             <span class="legend-item"><span class="swatch" style="background: var(--status-critical)"></span>Reject</span>
         </div>
@@ -150,12 +156,13 @@
                     {% for bar in month_bars %}
                     <a class="bar-link{{ ' active' if bar.month_key == active_month else '' }}"
                        href="{{ url_for('trend', month=bar.month_key) }}"
-                       aria-label="{{ bar.label }}: {{ bar.aligned }} aligned, {{ bar.quarantine }} quarantine, {{ bar.reject }} reject. Click to see this month's days."
-                       data-label="{{ bar.label }}" data-aligned="{{ bar.aligned }}"
+                       aria-label="{{ bar.label }}: {{ bar.aligned }} aligned, {{ bar.let_through }} not aligned but let through, {{ bar.quarantine }} quarantine, {{ bar.reject }} reject. Click to see this month's days."
+                       data-label="{{ bar.label }}" data-aligned="{{ bar.aligned }}" data-letthrough="{{ bar.let_through }}"
                        data-quarantine="{{ bar.quarantine }}" data-reject="{{ bar.reject }}">
                         <div class="bar-stack">
                             <div class="seg seg-reject" style="height: {{ bar.reject_h }}px"></div>
                             <div class="seg seg-quarantine" style="height: {{ bar.quarantine_h }}px"></div>
+                            <div class="seg seg-letthrough" style="height: {{ bar.let_through_h }}px"></div>
                             <div class="seg seg-aligned" style="height: {{ bar.aligned_h }}px"></div>
                         </div>
                     </a>
@@ -172,16 +179,17 @@
         <button type="button" class="table-toggle" id="monthly-table-toggle" aria-expanded="false">View as table</button>
         <table class="trend-table" id="monthly-table" hidden>
             <thead>
-                <tr><th>Month</th><th>Aligned</th><th>Quarantine</th><th>Reject</th><th>Total</th></tr>
+                <tr><th>Month</th><th class="num">Aligned</th><th class="num">Let through</th><th class="num">Quarantine</th><th class="num">Reject</th><th class="num">Total</th></tr>
             </thead>
             <tbody>
                 {% for bar in month_bars %}
                 <tr>
                     <td>{{ bar.label }}</td>
-                    <td>{{ bar.aligned }}</td>
-                    <td>{{ bar.quarantine }}</td>
-                    <td>{{ bar.reject }}</td>
-                    <td>{{ bar.total }}</td>
+                    <td class="num">{{ bar.aligned }}</td>
+                    <td class="num">{{ bar.let_through }}</td>
+                    <td class="num">{{ bar.quarantine }}</td>
+                    <td class="num">{{ bar.reject }}</td>
+                    <td class="num">{{ bar.total }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -199,6 +207,7 @@
     function showTooltip(el) {
         var label = el.dataset.label;
         var aligned = el.dataset.aligned;
+        var letThrough = el.dataset.letthrough;
         var quarantine = el.dataset.quarantine;
         var reject = el.dataset.reject;
 
@@ -207,7 +216,7 @@
         title.textContent = label;
         tooltip.appendChild(title);
 
-        [['Aligned', aligned], ['Quarantine', quarantine], ['Reject', reject]].forEach(function (row) {
+        [['Aligned', aligned], ['Not aligned, let through', letThrough], ['Quarantine', quarantine], ['Reject', reject]].forEach(function (row) {
             var line = document.createElement('div');
             line.textContent = row[0] + ': ' + row[1];
             tooltip.appendChild(line);

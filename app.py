@@ -3,6 +3,7 @@ import functools
 import math
 import os
 import re
+import time
 
 import dns.exception
 import dns.resolver
@@ -70,9 +71,45 @@ FIXED_PSEUDONYMS = dict(
 )
 
 
+# Everything below looks things up in DNS synchronously, per request. A short
+# lifetime caps the worst case for a slow/unresponsive nameserver.
+DNS_LOOKUP_TIMEOUT = 2  # seconds
+# How long the domain's own DNS settings (header) are cached, and how long
+# per-IP reverse DNS/country lookups are.
+DOMAIN_STATUS_TTL = 3600
+IP_LOOKUP_TTL = 86400
+# DKIM selectors come from received aggregate reports, which anyone can send
+# us — cap how many get looked up so fake reports can't slow every page down.
+MAX_DKIM_SELECTORS = 20
+
+
+def ttl_cache(seconds, maxsize=1024):
+    """Like functools.lru_cache, but entries expire — so a lookup that failed
+    once (e.g. a timeout) isn't remembered until the next restart."""
+
+    def decorator(func):
+        cache = {}
+
+        @functools.wraps(func)
+        def wrapper(*args):
+            now = time.monotonic()
+            hit = cache.get(args)
+            if hit and now - hit[0] < seconds:
+                return hit[1]
+            value = func(*args)
+            if len(cache) >= maxsize:
+                cache.clear()
+            cache[args] = (now, value)
+            return value
+
+        return wrapper
+
+    return decorator
+
+
 def _txt_records(name):
     try:
-        answers = dns.resolver.resolve(name, "TXT")
+        answers = dns.resolver.resolve(name, "TXT", lifetime=DNS_LOOKUP_TIMEOUT)
         return ["".join(s.decode() for s in r.strings) for r in answers]
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.DNSException):
         return []
@@ -91,14 +128,14 @@ def _parse_tags(record):
 
 def get_domain_status(domain):
     try:
-        mx_answers = dns.resolver.resolve(domain, "MX")
+        mx_answers = dns.resolver.resolve(domain, "MX", lifetime=DNS_LOOKUP_TIMEOUT)
         mx_records = sorted((r.preference, str(r.exchange).rstrip(".")) for r in mx_answers)
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.DNSException):
         mx_records = []
 
     spf_records = [r for r in _txt_records(domain) if r.lower().startswith("v=spf1")]
 
-    dmarc_records = _txt_records(f"_dmarc.{domain}")
+    dmarc_records = [r for r in _txt_records(f"_dmarc.{domain}") if r.lower().startswith("v=dmarc1")]
     dmarc_tags = _parse_tags(dmarc_records[0]) if dmarc_records else None
 
     tlsrpt_records = _txt_records(f"_smtp._tls.{domain}")
@@ -109,8 +146,28 @@ def get_domain_status(domain):
         "spf_record": spf_records[0] if spf_records else None,
         "dmarc_record": dmarc_records[0] if dmarc_records else None,
         "dmarc_tags": dmarc_tags,
+        "dmarc_policy": _dmarc_policy(dmarc_tags),
         "tlsrpt_record": tlsrpt_records[0] if tlsrpt_records else None,
     }
+
+
+def _dmarc_policy(tags):
+    """(p, pct, level) for a parsed DMARC record — level is the badge colour
+    ("good"/"warn"/"bad"): only p=reject applied to all mail counts as good."""
+    if tags is None:
+        return None
+    p = tags.get("p", "none").lower()
+    try:
+        pct = max(0, min(100, int(tags.get("pct", "100"))))
+    except ValueError:
+        pct = 100
+    if p == "reject" and pct == 100:
+        level = "good"
+    elif p in ("reject", "quarantine") and pct > 0:
+        level = "warn"
+    else:
+        level = "bad"
+    return {"p": p, "pct": pct, "level": level}
 
 
 def get_seen_dkim_selectors(cur, domain):
@@ -121,14 +178,16 @@ def get_seen_dkim_selectors(cur, domain):
     # *candidates*, not confirmed appelo.nl settings.
     cur.execute(
         """
-        SELECT DISTINCT selector
+        SELECT selector
         FROM dmarc.aggregate_record_dkim_results
         WHERE domain = %s AND selector IS NOT NULL
-        ORDER BY selector
+        GROUP BY selector
+        ORDER BY max(id) DESC
+        LIMIT %s
         """,
-        (domain,),
+        (domain, MAX_DKIM_SELECTORS),
     )
-    return [row["selector"] for row in cur.fetchall()]
+    return sorted(row["selector"] for row in cur.fetchall())
 
 
 def get_confirmed_dkim_records(domain, selectors):
@@ -146,10 +205,14 @@ def get_confirmed_dkim_records(domain, selectors):
     return confirmed
 
 
+SPF_ALL_RE = re.compile(r"^([+\-~?]?)all$", re.IGNORECASE)
+
+
 def _spf_all_qualifier(spf_record):
     for token in spf_record.split():
-        if token.lower().endswith("all"):
-            return token[:-3] or "+"
+        m = SPF_ALL_RE.match(token)
+        if m:
+            return m[1] or "+"
     return None
 
 
@@ -183,12 +246,14 @@ def build_plain_summary(status):
         lines.append("No confirmed DKIM key found in DNS.")
 
     if status["dmarc_tags"]:
-        p = status["dmarc_tags"].get("p", "none")
+        policy = status["dmarc_policy"]
         policy_text = {
             "reject": "fully rejected",
             "quarantine": "treated as spam/quarantined",
             "none": "let through as-is (monitoring only, not enforced)",
-        }.get(p, p)
+        }.get(policy["p"], policy["p"])
+        if policy["p"] != "none" and policy["pct"] < 100:
+            policy_text = f"{policy_text} — but only {policy['pct']}% of them, the rest is let through"
         lines.append(
             "Messages that aren't aligned on either SPF or DKIM are " + policy_text + "."
         )
@@ -235,9 +300,14 @@ def get_mailsec_connection():
 
 def get_domain_overview(cur):
     """appelo.nl's own settings and their meaning — no usage/abuse data."""
-    domain_status = get_domain_status(MONITORED_DOMAIN)
     selectors = get_seen_dkim_selectors(cur, MONITORED_DOMAIN)
-    domain_status["dkim_records"] = get_confirmed_dkim_records(MONITORED_DOMAIN, selectors)
+    return _domain_overview(MONITORED_DOMAIN, tuple(selectors))
+
+
+@ttl_cache(DOMAIN_STATUS_TTL)
+def _domain_overview(domain, selectors):
+    domain_status = get_domain_status(domain)
+    domain_status["dkim_records"] = get_confirmed_dkim_records(domain, selectors)
     domain_status["plain_summary"] = build_plain_summary(domain_status)
     return domain_status
 
@@ -265,6 +335,18 @@ def explain_failure(record):
     }.get(record["disposition"], record["disposition"])
 
     return f"{reason_text} → message was {outcome}."
+
+
+@app.template_filter("pct_status")
+def pct_status(pct):
+    """Badge/tile colour for an "aligned %" — the same thresholds everywhere."""
+    if pct is None:
+        return ""
+    if pct >= 95:
+        return "good"
+    if pct >= 80:
+        return "warn"
+    return "bad"
 
 
 REPORTS_PER_PAGE = 50
@@ -392,12 +474,12 @@ def _nice_axis_max(value):
 def _scale_bars(entries):
     # Adds total/*_h (pixel height) keys to each entry in place, sharing one
     # axis scale across all of them, and returns the y-axis tick values.
-    axis_max = _nice_axis_max(max((e["aligned"] + e["quarantine"] + e["reject"] for e in entries), default=0))
     for e in entries:
-        e["total"] = e["aligned"] + e["quarantine"] + e["reject"]
-        e["aligned_h"] = round(e["aligned"] / axis_max * TREND_PLOT_HEIGHT_PX)
-        e["quarantine_h"] = round(e["quarantine"] / axis_max * TREND_PLOT_HEIGHT_PX)
-        e["reject_h"] = round(e["reject"] / axis_max * TREND_PLOT_HEIGHT_PX)
+        e["total"] = e["aligned"] + e["let_through"] + e["quarantine"] + e["reject"]
+    axis_max = _nice_axis_max(max((e["total"] for e in entries), default=0))
+    for e in entries:
+        for key in ("aligned", "let_through", "quarantine", "reject"):
+            e[f"{key}_h"] = round(e[key] / axis_max * TREND_PLOT_HEIGHT_PX)
     tick_count = 5
     return [round(axis_max * i / (tick_count - 1)) for i in reversed(range(tick_count))]
 
@@ -454,7 +536,10 @@ def trend():
                     ), 0) AS quarantine,
                     coalesce(sum(rec.count) FILTER (
                         WHERE NOT rec.dmarc_aligned AND rec.disposition = 'reject'
-                    ), 0) AS reject
+                    ), 0) AS reject,
+                    coalesce(sum(rec.count) FILTER (
+                        WHERE NOT rec.dmarc_aligned AND rec.disposition NOT IN ('quarantine', 'reject')
+                    ), 0) AS let_through
                 FROM dmarc.aggregate_records rec
                 GROUP BY period
                 ORDER BY period
@@ -472,7 +557,10 @@ def trend():
                     ), 0) AS quarantine,
                     coalesce(sum(rec.count) FILTER (
                         WHERE NOT rec.dmarc_aligned AND rec.disposition = 'reject'
-                    ), 0) AS reject
+                    ), 0) AS reject,
+                    coalesce(sum(rec.count) FILTER (
+                        WHERE NOT rec.dmarc_aligned AND rec.disposition NOT IN ('quarantine', 'reject')
+                    ), 0) AS let_through
                 FROM generate_series(%(start)s::date, %(end)s::date, interval '1 day') AS d
                 LEFT JOIN dmarc.aggregate_records rec ON rec.interval_begin::date = d::date
                 GROUP BY d::date
@@ -491,6 +579,7 @@ def trend():
             "aligned": r["aligned"],
             "quarantine": r["quarantine"],
             "reject": r["reject"],
+            "let_through": r["let_through"],
         }
         for r in month_rows
     ]
@@ -503,6 +592,7 @@ def trend():
             "aligned": r["aligned"],
             "quarantine": r["quarantine"],
             "reject": r["reject"],
+            "let_through": r["let_through"],
         }
         for r in day_rows
     ]
@@ -543,6 +633,9 @@ def sources():
                     coalesce(sum(count) FILTER (
                         WHERE NOT dmarc_aligned AND disposition = 'reject'
                     ), 0) AS reject,
+                    coalesce(sum(count) FILTER (
+                        WHERE NOT dmarc_aligned AND disposition NOT IN ('quarantine', 'reject')
+                    ), 0) AS let_through,
                     min(interval_begin) AS first_seen,
                     max(interval_begin) AS last_seen
                 FROM dmarc.aggregate_records
@@ -567,15 +660,10 @@ def sources():
     )
 
 
-# The security/sources pages do one of these lookups per distinct source IP,
-# synchronously, per request — a couple of slow/unresponsive nameservers used
-# to be enough to make the page take tens of seconds. A short lifetime caps
-# the per-IP worst case, and caching means the same repeat-offender IPs
-# (which show up on every page load) don't get looked up again and again.
-DNS_LOOKUP_TIMEOUT = 2  # seconds
-
-
-@functools.lru_cache(maxsize=1024)
+# The security page does these lookups per distinct source IP — caching means
+# the same repeat-offender IPs (which show up on every page load) don't get
+# looked up again and again.
+@ttl_cache(IP_LOOKUP_TTL)
 def _reverse_dns(ip):
     try:
         rev_name = dns.reversename.from_address(ip)
@@ -585,7 +673,7 @@ def _reverse_dns(ip):
         return None
 
 
-@functools.lru_cache(maxsize=1024)
+@ttl_cache(IP_LOOKUP_TTL)
 def _country_for_ip(ip):
     # Team Cymru's free IP-to-ASN/country DNS service — same DNS-lookup
     # mechanism already used elsewhere in this file, no API key/library needed.
@@ -641,22 +729,39 @@ class AddressPseudonyms:
     """Replaces our own users' addresses on the (public) security page with
     "Gebruiker A", "Gebruiker B", ... Letters are handed out in order of first
     appearance in the mailsec tables, so they stay the same between page loads.
+    Anyone else's address is reduced to its domain ("…@example.com"): it says
+    who our users correspond with.
+
+    Kept per worker and only fed rows newer than the last refresh, instead of
+    re-reading the whole history on every page load.
     """
 
-    def __init__(self, cur):
+    def __init__(self):
         self.labels = {address: f"Gebruiker {letters.upper()}" for address, letters in FIXED_PSEUDONYMS.items()}
         self.next_index = 0
+        self.seen_until = None
+
+    def refresh(self, cur):
+        # >= rather than >: rows sharing the last timestamp get fed again,
+        # which is harmless since labelling an address twice is a no-op.
         cur.execute(
             """
-            SELECT occurred_at, mail_from AS a, rcpt_to AS b, reason FROM mailsec.rejects_given
-            UNION ALL
-            SELECT occurred_at, orig_to, mail_to, reason FROM mailsec.rejects_received
-            ORDER BY occurred_at
-            """
+            SELECT * FROM (
+                SELECT occurred_at, 0 AS src, id, mail_from AS a, rcpt_to AS b, reason
+                FROM mailsec.rejects_given
+                UNION ALL
+                SELECT occurred_at, 1, id, orig_to, mail_to, reason
+                FROM mailsec.rejects_received
+            ) t
+            WHERE %(since)s::timestamptz IS NULL OR occurred_at >= %(since)s
+            ORDER BY occurred_at, src, id
+            """,
+            {"since": self.seen_until},
         )
         for r in cur.fetchall():
             for value in (r["a"], r["b"], r["reason"]):
                 self.mask(value)
+            self.seen_until = r["occurred_at"]
 
     def label(self, address):
         own, via = _own_address(address)
@@ -673,7 +778,10 @@ class AddressPseudonyms:
     def mask(self, text):
         if not text:
             return text
-        return EMAIL_RE.sub(lambda m: self.label(m[0]) or m[0], text)
+        return EMAIL_RE.sub(lambda m: self.label(m[0]) or "…@" + m[0].rpartition("@")[2], text)
+
+
+_pseudonyms = AddressPseudonyms()
 
 
 @app.route("/security")
@@ -743,7 +851,8 @@ def security():
             )
             rejects_received = cur.fetchall()
 
-            pseudonyms = AddressPseudonyms(cur)
+            pseudonyms = _pseudonyms
+            pseudonyms.refresh(cur)
             for r in rejects_given:
                 for key in ("mail_from", "rcpt_to", "reason"):
                     r[key] = pseudonyms.mask(r[key])

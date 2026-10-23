@@ -63,11 +63,11 @@
                  vertical-align: top; }
         thead th { background: var(--surface-2); color: var(--text-secondary); font-weight: 600;
                    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em;
-                   white-space: nowrap; position: sticky; top: 0; }
+                   white-space: nowrap; }
         tbody tr:last-child td { border-bottom: none; }
         tbody tr:hover td { background: var(--surface-2); }
         td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-        td.mono { font-family: var(--mono); font-size: 0.82rem; white-space: nowrap; }
+        .mono { font-family: var(--mono); font-size: 0.82rem; white-space: nowrap; }
         td.nowrap { white-space: nowrap; }
         td.empty { text-align: center; color: var(--muted); padding: 1.5rem; }
 
@@ -148,9 +148,8 @@
     {% block extra_head %}{% endblock %}
 </head>
 <body>
-    {% set dmarc_p = (domain_status.dmarc_tags or {}).get('p', 'none') %}
     <header>
-        <h1>🛡️ DMARC overview &ndash; {{ domain_status.domain }}</h1>
+        <h1><span aria-hidden="true">🛡️</span> DMARC overview &ndash; {{ domain_status.domain }}</h1>
         <p class="subtitle">Mail authentication status, reports and mail server security</p>
     </header>
 
@@ -188,7 +187,8 @@
                     <th>DMARC</th>
                     <td>
                         {% if domain_status.dmarc_record %}
-                            <span class="badge {{ {'reject': 'good', 'quarantine': 'warn'}.get(dmarc_p, 'bad') }}">p={{ dmarc_p }}</span>
+                            {% set policy = domain_status.dmarc_policy %}
+                            <span class="badge {{ policy.level }}">p={{ policy.p }}{% if policy.pct < 100 %} pct={{ policy.pct }}{% endif %}</span>
                             <code>{{ domain_status.dmarc_record }}</code>
                         {% else %}<span class="missing">no DMARC record found</span>{% endif %}
                     </td>
@@ -216,12 +216,12 @@
 
     <div class="layout">
         <nav>
-            <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'data' else '' }}"><span class="icon">📥</span>Received reports</a>
-            <a href="{{ url_for('flagged') }}" class="{{ 'active' if active_page == 'flagged' else '' }}"><span class="icon">🚩</span>Flagged mail</a>
-            <a href="{{ url_for('trend') }}" class="{{ 'active' if active_page == 'trend' else '' }}"><span class="icon">📊</span>Volume over time</a>
-            <a href="{{ url_for('sources') }}" class="{{ 'active' if active_page == 'sources' else '' }}"><span class="icon">🌐</span>Top sources</a>
-            <a href="{{ url_for('tls_reports') }}" class="{{ 'active' if active_page == 'tls' else '' }}"><span class="icon">🔒</span>TLS reports</a>
-            <a href="{{ url_for('security') }}" class="{{ 'active' if active_page == 'security' else '' }}"><span class="icon">🛡️</span>Mail security</a>
+            <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'data' else '' }}"><span class="icon" aria-hidden="true">📥</span>Received reports</a>
+            <a href="{{ url_for('flagged') }}" class="{{ 'active' if active_page == 'flagged' else '' }}"><span class="icon" aria-hidden="true">🚩</span>Flagged mail</a>
+            <a href="{{ url_for('trend') }}" class="{{ 'active' if active_page == 'trend' else '' }}"><span class="icon" aria-hidden="true">📊</span>Volume over time</a>
+            <a href="{{ url_for('sources') }}" class="{{ 'active' if active_page == 'sources' else '' }}"><span class="icon" aria-hidden="true">🌐</span>Top sources</a>
+            <a href="{{ url_for('tls_reports') }}" class="{{ 'active' if active_page == 'tls' else '' }}"><span class="icon" aria-hidden="true">🔒</span>TLS reports</a>
+            <a href="{{ url_for('security') }}" class="{{ 'active' if active_page == 'security' else '' }}"><span class="icon" aria-hidden="true">🛡️</span>Mail security</a>
         </nav>
         <main>
             {% block content %}{% endblock %}
