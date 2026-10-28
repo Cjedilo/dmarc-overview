@@ -1,5 +1,7 @@
 import datetime
 import functools
+import hashlib
+import ipaddress
 import math
 import os
 import re
@@ -11,7 +13,9 @@ import dns.reversename
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, url_for
+from flask import Flask, abort, g, redirect, render_template, request, session, url_for
+from werkzeug.routing import BaseConverter
+from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
@@ -61,7 +65,36 @@ MAILSEC_DB_NAME = os.environ.get("MAILSEC_DB_NAME", "dmarc")
 MAILSEC_DB_USER = os.environ.get("MAILSEC_DB_USER", "mailsec")
 MAILSEC_DB_PASSWORD = os.environ["MAILSEC_DB_PASSWORD"]
 
-MONITORED_DOMAIN = os.environ.get("MONITORED_DOMAIN", "appelo.nl")
+# The first domain is our own: its pages are public and it has the extra pages
+# (TLS reports, mail security). The others only get the DMARC report pages,
+# each behind its own password.
+MONITORED_DOMAINS = [
+    d.strip().lower().rstrip(".")
+    for d in os.environ.get("MONITORED_DOMAINS", os.environ.get("MONITORED_DOMAIN", "appelo.nl")).split(",")
+    if d.strip()
+]
+MONITORED_DOMAIN = MONITORED_DOMAINS[0]
+# "voorbeeld.nl=<hash>,ander.nl=<hash>", hashes from scripts/hash_domain_password.py.
+# A domain without a password here can't be opened at all.
+DOMAIN_PASSWORDS = {
+    domain.strip().lower(): hashed.strip()
+    for domain, _, hashed in (
+        pair.partition("=") for pair in os.environ.get("DOMAIN_PASSWORDS", "").split(",")
+    )
+    if hashed.strip()
+}
+
+app.secret_key = os.environ.get("SECRET_KEY")
+if DOMAIN_PASSWORDS and not app.secret_key:
+    raise RuntimeError("DOMAIN_PASSWORDS is set, so SECRET_KEY is needed for the login cookie")
+app.config.update(
+    # Other apps on appelo.nl may use Flask's default "session" cookie too.
+    SESSION_COOKIE_NAME="dmarc_session",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "true").lower() != "false",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=30),
+)
 # Fixed "Gebruiker X" letters for known users on the security page, e.g.
 # "bas@appelo.nl=B,cecile@appelo.nl=C". Everyone else gets the next free letter.
 FIXED_PSEUDONYMS = dict(
@@ -69,6 +102,43 @@ FIXED_PSEUDONYMS = dict(
     for pair in os.environ.get("FIXED_PSEUDONYMS", "").split(",")
     if "=" in pair
 )
+
+# Only these may see the security page (mail server logs); everyone else gets
+# a 404 and no menu link. Comma-separated networks.
+SECURITY_ALLOWED_NETWORKS = [
+    ipaddress.ip_network(net.strip())
+    for net in os.environ.get(
+        "SECURITY_ALLOWED_NETWORKS",
+        "192.168.93.0/24,45.142.232.176/32,2a10:3781:5551:1::/64",
+    ).split(",")
+    if net.strip()
+]
+# Apache on this host reverse-proxies to us, so every request comes from here;
+# only then is X-Forwarded-For trusted (anyone else could just set it).
+TRUSTED_PROXIES = {"127.0.0.1", "::1"}
+
+
+def _client_ip():
+    addr = request.remote_addr
+    if addr in TRUSTED_PROXIES:
+        # mod_proxy appends the address it got the request from as the last
+        # entry; anything before that was supplied by the client.
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            addr = forwarded.split(",")[-1].strip()
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    # An IPv4 client on a dual-stack socket shows up as ::ffff:a.b.c.d.
+    if ip.version == 6 and ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    return ip
+
+
+def can_see_security():
+    ip = _client_ip()
+    return ip is not None and any(ip in net for net in SECURITY_ALLOWED_NETWORKS)
 
 
 # Everything below looks things up in DNS synchronously, per request. A short
@@ -299,9 +369,10 @@ def get_mailsec_connection():
 
 
 def get_domain_overview(cur):
-    """appelo.nl's own settings and their meaning — no usage/abuse data."""
-    selectors = get_seen_dkim_selectors(cur, MONITORED_DOMAIN)
-    return _domain_overview(MONITORED_DOMAIN, tuple(selectors))
+    """The current domain's own settings and their meaning — no usage/abuse data."""
+    domain = current_domain()
+    selectors = get_seen_dkim_selectors(cur, domain)
+    return _domain_overview(domain, tuple(selectors))
 
 
 @ttl_cache(DOMAIN_STATUS_TTL)
@@ -362,9 +433,72 @@ PERIODS = {
 DEFAULT_PERIOD = "30d"
 
 
+class DomainConverter(BaseConverter):
+    # Needs a dot, so /security and the old /trend etc. never match it.
+    regex = r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+"
+
+    def to_python(self, value):
+        return value.lower()
+
+
+app.url_map.converters["domain"] = DomainConverter
+
+# Pages only our own domain has.
+PRIMARY_ONLY_ENDPOINTS = {"tls_reports"}
+
+
+def current_domain():
+    # Pages outside /<domain>/ (the security page) are about our own domain.
+    return g.get("domain", MONITORED_DOMAIN)
+
+
+@app.url_value_preprocessor
+def _pull_domain(endpoint, values):
+    if values and "domain" in values:
+        g.domain = values.pop("domain")
+
+
+@app.url_defaults
+def _add_domain(endpoint, values):
+    if "domain" not in values and app.url_map.is_endpoint_expecting(endpoint, "domain"):
+        values["domain"] = current_domain()
+
+
+def _password_tag(domain):
+    # Stored in the (signed, not encrypted) session cookie instead of a plain
+    # "logged in" flag, so changing a domain's password logs everyone out.
+    hashed = DOMAIN_PASSWORDS.get(domain) if domain in MONITORED_DOMAINS else None
+    return hashlib.sha256(hashed.encode()).hexdigest()[:16] if hashed else None
+
+
+def is_unlocked(domain):
+    tag = _password_tag(domain)
+    return tag is not None and session.get("unlocked", {}).get(domain) == tag
+
+
+@app.before_request
+def _check_domain_access():
+    domain = g.get("domain")
+    if domain is None or domain == MONITORED_DOMAIN or request.endpoint in ("login", "logout"):
+        return None
+    if request.endpoint in PRIMARY_ONLY_ENDPOINTS:
+        abort(404)
+    # Unknown domains end up at the login page too, so it doesn't tell which
+    # domains are monitored.
+    if not is_unlocked(domain):
+        return redirect(url_for("login"))
+    return None
+
+
 @app.context_processor
 def inject_periods():
-    return {"periods": PERIODS}
+    domain = current_domain()
+    return {
+        "periods": PERIODS,
+        "domain": domain,
+        "is_primary_domain": domain == MONITORED_DOMAIN,
+        "can_see_security": domain == MONITORED_DOMAIN and can_see_security(),
+    }
 
 
 def _period_from_request():
@@ -381,6 +515,26 @@ def _period_from_request():
 def _since(column):
     # SQL condition for the period filter; expects a %(since)s parameter.
     return f"(%(since)s::timestamptz IS NULL OR {column} >= %(since)s)"
+
+
+def _for_domain(column):
+    """SQL condition: `column` is the current domain or one of its subdomains,
+    but not a subdomain that is monitored as a domain of its own. Expects the
+    parameters from _domain_params()."""
+    def matches(d):
+        return f"(lower({column}) = {d} OR right(lower({column}), length({d}) + 1) = '.' || {d})"
+    return (
+        f"({matches('%(domain)s')} AND NOT EXISTS ("
+        f"SELECT 1 FROM unnest(%(own_subdomains)s::text[]) s WHERE {matches('s')}))"
+    )
+
+
+def _domain_params():
+    domain = current_domain()
+    return {
+        "domain": domain,
+        "own_subdomains": [d for d in MONITORED_DOMAINS if d.endswith("." + domain)],
+    }
 
 
 def _paginated(cur, sql, params, page_param="page"):
@@ -415,10 +569,52 @@ def url_with(param, value, anchor=None):
     return url_for(request.endpoint, _anchor=anchor, **args)
 
 
+_DUMMY_PASSWORD_HASH = generate_password_hash("not anyone's password")
+
+
+@app.route("/<domain:domain>/login", methods=["GET", "POST"])
+def login():
+    domain = g.domain
+    if domain == MONITORED_DOMAIN or is_unlocked(domain):
+        return redirect(url_for("trend"))
+
+    error = None
+    if request.method == "POST":
+        hashed = DOMAIN_PASSWORDS.get(domain) if domain in MONITORED_DOMAINS else None
+        # Unknown domains are checked against a dummy hash, so they take
+        # just as long to fail.
+        if check_password_hash(hashed or _DUMMY_PASSWORD_HASH, request.form.get("password", "")) and hashed:
+            session.permanent = True
+            session["unlocked"] = {**session.get("unlocked", {}), domain: _password_tag(domain)}
+            return redirect(url_for("trend"))
+        # Slows down guessing.
+        time.sleep(1)
+        error = "Wrong password."
+
+    return render_template("login.html", error=error), 401 if error else 200
+
+
+@app.route("/<domain:domain>/logout", methods=["POST"])
+def logout():
+    unlocked = dict(session.get("unlocked", {}))
+    unlocked.pop(g.domain, None)
+    session["unlocked"] = unlocked
+    return redirect(url_for("login"))
+
+
+# Everything used to live at the root, for our own domain only; keep those
+# links/bookmarks working.
 @app.route("/")
-def index():
+@app.route("/<any(trend, reports, flagged, sources, tls):page>")
+def old_url(page="trend"):
+    endpoint = {"tls": "tls_reports"}.get(page, page)
+    return redirect(url_for(endpoint, domain=MONITORED_DOMAIN, **request.args.to_dict()))
+
+
+@app.route("/<domain:domain>/reports")
+def reports():
     period, since = _period_from_request()
-    params = {"since": since}
+    params = {"since": since, **_domain_params()}
 
     conn = get_connection()
     try:
@@ -433,7 +629,7 @@ def index():
                     coalesce(sum(rec.count) FILTER (WHERE rec.dmarc_aligned), 0) AS aligned_messages
                 FROM dmarc.aggregate_reports ar
                 LEFT JOIN dmarc.aggregate_records rec ON rec.report_id = ar.id
-                WHERE {_since("ar.date_begin")}
+                WHERE {_since("ar.date_begin")} AND {_for_domain("ar.domain")}
                 """,
                 params,
             )
@@ -453,7 +649,7 @@ def index():
                     coalesce(sum(rec.count) FILTER (WHERE rec.disposition = 'reject'), 0) AS rejected_count
                 FROM dmarc.aggregate_reports ar
                 LEFT JOIN dmarc.aggregate_records rec ON rec.report_id = ar.id
-                WHERE {_since("ar.date_begin")}
+                WHERE {_since("ar.date_begin")} AND {_for_domain("ar.domain")}
                 GROUP BY ar.id
                 ORDER BY ar.date_begin DESC, ar.id DESC
                 """,
@@ -473,7 +669,7 @@ def index():
     )
 
 
-@app.route("/flagged")
+@app.route("/<domain:domain>/flagged")
 def flagged():
     period, since = _period_from_request()
 
@@ -509,10 +705,10 @@ def flagged():
                     ) AS override_reason
                 FROM dmarc.aggregate_records rec
                 JOIN dmarc.aggregate_reports ar ON ar.id = rec.report_id
-                WHERE NOT rec.dmarc_aligned AND {_since("rec.interval_begin")}
+                WHERE NOT rec.dmarc_aligned AND {_since("rec.interval_begin")} AND {_for_domain("ar.domain")}
                 ORDER BY rec.interval_begin DESC, rec.id DESC
                 """,
-                {"since": since},
+                {"since": since, **_domain_params()},
             )
             for record in flagged_records:
                 record["reason"] = explain_failure(record)
@@ -584,7 +780,8 @@ def _daily_range(month_param):
     return start, end, label, first_of_month.strftime("%Y-%m")
 
 
-@app.route("/trend")
+# A domain's landing page.
+@app.route("/<domain:domain>/")
 def trend():
     daily_start, daily_end, daily_label, active_month = _daily_range(request.args.get("month"))
 
@@ -594,7 +791,7 @@ def trend():
             domain_status = get_domain_overview(cur)
 
             cur.execute(
-                """
+                f"""
                 SELECT
                     date_trunc('month', rec.interval_begin)::date AS period,
                     coalesce(sum(rec.count) FILTER (WHERE rec.dmarc_aligned), 0) AS aligned,
@@ -608,14 +805,17 @@ def trend():
                         WHERE NOT rec.dmarc_aligned AND rec.disposition NOT IN ('quarantine', 'reject')
                     ), 0) AS let_through
                 FROM dmarc.aggregate_records rec
+                JOIN dmarc.aggregate_reports ar ON ar.id = rec.report_id
+                WHERE {_for_domain("ar.domain")}
                 GROUP BY period
                 ORDER BY period
-                """
+                """,
+                _domain_params(),
             )
             month_rows = cur.fetchall()
 
             cur.execute(
-                """
+                f"""
                 SELECT
                     d::date AS day,
                     coalesce(sum(rec.count) FILTER (WHERE rec.dmarc_aligned), 0) AS aligned,
@@ -629,11 +829,14 @@ def trend():
                         WHERE NOT rec.dmarc_aligned AND rec.disposition NOT IN ('quarantine', 'reject')
                     ), 0) AS let_through
                 FROM generate_series(%(start)s::date, %(end)s::date, interval '1 day') AS d
-                LEFT JOIN dmarc.aggregate_records rec ON rec.interval_begin::date = d::date
+                LEFT JOIN (
+                    dmarc.aggregate_records rec
+                    JOIN dmarc.aggregate_reports ar ON ar.id = rec.report_id AND {_for_domain("ar.domain")}
+                ) ON rec.interval_begin::date = d::date
                 GROUP BY d::date
                 ORDER BY d::date
                 """,
-                {"start": daily_start, "end": daily_end},
+                {"start": daily_start, "end": daily_end, **_domain_params()},
             )
             day_rows = cur.fetchall()
     finally:
@@ -679,7 +882,7 @@ def trend():
     )
 
 
-@app.route("/sources")
+@app.route("/<domain:domain>/sources")
 def sources():
     period, since = _period_from_request()
 
@@ -692,28 +895,29 @@ def sources():
                 cur,
                 f"""
                 SELECT
-                    source_ip,
-                    max(source_country) AS source_country,
-                    max(source_reverse_dns) AS source_reverse_dns,
-                    sum(count) AS total,
-                    coalesce(sum(count) FILTER (WHERE dmarc_aligned), 0) AS aligned,
-                    coalesce(sum(count) FILTER (
-                        WHERE NOT dmarc_aligned AND disposition = 'quarantine'
+                    rec.source_ip,
+                    max(rec.source_country) AS source_country,
+                    max(rec.source_reverse_dns) AS source_reverse_dns,
+                    sum(rec.count) AS total,
+                    coalesce(sum(rec.count) FILTER (WHERE rec.dmarc_aligned), 0) AS aligned,
+                    coalesce(sum(rec.count) FILTER (
+                        WHERE NOT rec.dmarc_aligned AND rec.disposition = 'quarantine'
                     ), 0) AS quarantine,
-                    coalesce(sum(count) FILTER (
-                        WHERE NOT dmarc_aligned AND disposition = 'reject'
+                    coalesce(sum(rec.count) FILTER (
+                        WHERE NOT rec.dmarc_aligned AND rec.disposition = 'reject'
                     ), 0) AS reject,
-                    coalesce(sum(count) FILTER (
-                        WHERE NOT dmarc_aligned AND disposition NOT IN ('quarantine', 'reject')
+                    coalesce(sum(rec.count) FILTER (
+                        WHERE NOT rec.dmarc_aligned AND rec.disposition NOT IN ('quarantine', 'reject')
                     ), 0) AS let_through,
-                    min(interval_begin) AS first_seen,
-                    max(interval_begin) AS last_seen
-                FROM dmarc.aggregate_records
-                WHERE {_since("interval_begin")}
-                GROUP BY source_ip
-                ORDER BY total DESC, source_ip
+                    min(rec.interval_begin) AS first_seen,
+                    max(rec.interval_begin) AS last_seen
+                FROM dmarc.aggregate_records rec
+                JOIN dmarc.aggregate_reports ar ON ar.id = rec.report_id
+                WHERE {_since("rec.interval_begin")} AND {_for_domain("ar.domain")}
+                GROUP BY rec.source_ip
+                ORDER BY total DESC, rec.source_ip
                 """,
-                {"since": since},
+                {"since": since, **_domain_params()},
             )
     finally:
         conn.close()
@@ -866,6 +1070,8 @@ def _add_ip_details(rows):
 
 @app.route("/security")
 def security():
+    if not can_see_security():
+        abort(404)
     period, since = _period_from_request()
     params = {"since": since}
 
@@ -1000,7 +1206,7 @@ def security():
     )
 
 
-@app.route("/tls")
+@app.route("/<domain:domain>/tls")
 def tls_reports():
     period, since = _period_from_request()
 
@@ -1035,10 +1241,10 @@ def tls_reports():
                     ) AS failure_summary
                 FROM dmarc.smtp_tls_policies p
                 JOIN dmarc.smtp_tls_reports r ON r.id = p.report_id
-                WHERE {_since("r.date_end")}
+                WHERE {_since("r.date_end")} AND {_for_domain("p.policy_domain")}
                 ORDER BY r.date_end DESC, r.organization_name, p.id
                 """,
-                {"since": since},
+                {"since": since, **_domain_params()},
             )
     finally:
         conn.close()

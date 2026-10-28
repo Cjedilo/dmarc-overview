@@ -45,9 +45,16 @@ DB_NAME = os.environ.get("DB_NAME", "dmarc")
 DB_USER = os.environ.get("DB_USER", "dmarc")
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
-# Only reports about this domain (or its subdomains) are stored. Anyone can
-# mail a report to the rua address, about any domain; those are skipped.
-MONITORED_DOMAIN = os.environ.get("MONITORED_DOMAIN", "appelo.nl").lower()
+# Only reports about these domains (or their subdomains) are stored. Anyone can
+# mail a report to the rua address, about any domain; those are skipped. The
+# first one is our own domain: only for that one are TLS and failure reports
+# kept too, the others only get DMARC aggregate reports.
+MONITORED_DOMAINS = [
+    d.strip().lower().rstrip(".")
+    for d in os.environ.get("MONITORED_DOMAINS", os.environ.get("MONITORED_DOMAIN", "appelo.nl")).split(",")
+    if d.strip()
+]
+PRIMARY_DOMAIN = MONITORED_DOMAINS[0]
 
 # Set to "false" once the server (192.168.93.11) has outbound internet and you
 # want reverse-DNS/country enrichment of source IPs; otherwise those columns stay NULL.
@@ -201,9 +208,17 @@ def _parse_naive_utc(timestamp: str) -> datetime:
     return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
-def _is_monitored(domain: str | None) -> bool:
+def _is_under(domain: str | None, roots: list[str]) -> bool:
     domain = (domain or "").lower().rstrip(".")
-    return domain == MONITORED_DOMAIN or domain.endswith("." + MONITORED_DOMAIN)
+    return any(domain == root or domain.endswith("." + root) for root in roots)
+
+
+def _is_monitored(domain: str | None) -> bool:
+    return _is_under(domain, MONITORED_DOMAINS)
+
+
+def _is_primary(domain: str | None) -> bool:
+    return _is_under(domain, [PRIMARY_DOMAIN])
 
 
 def store_aggregate_report(cur, report: AggregateReport, backfill: bool = False) -> None:
@@ -212,11 +227,11 @@ def store_aggregate_report(cur, report: AggregateReport, backfill: bool = False)
 
     if not _is_monitored(policy["domain"]):
         logger.warning(
-            "Skipping report %s from %s: it's about %s, not %s",
+            "Skipping report %s from %s: it's about %s, not one of %s",
             metadata["report_id"],
             metadata["org_name"],
             policy["domain"],
-            MONITORED_DOMAIN,
+            ", ".join(MONITORED_DOMAINS),
         )
         return
 
@@ -345,12 +360,12 @@ def store_aggregate_report(cur, report: AggregateReport, backfill: bool = False)
 
 
 def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
-    if not any(_is_monitored(policy["policy_domain"]) for policy in report["policies"]):
+    if not any(_is_primary(policy["policy_domain"]) for policy in report["policies"]):
         logger.warning(
             "Skipping TLS-RPT report %s from %s: no policy for %s",
             report["report_id"],
             report["organization_name"],
-            MONITORED_DOMAIN,
+            PRIMARY_DOMAIN,
         )
         return
 
@@ -385,7 +400,7 @@ def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
     report_db_id = row[0]
 
     for policy in report["policies"]:
-        if not _is_monitored(policy["policy_domain"]):
+        if not _is_primary(policy["policy_domain"]):
             continue
         cur.execute(
             """
@@ -432,8 +447,8 @@ def store_smtp_tls_report(cur, report: SMTPTLSReport) -> None:
 
 
 def store_failure_report_summary(cur, report: FailureReport) -> None:
-    if not _is_monitored(report["reported_domain"]):
-        logger.warning("Skipping failure report about %s, not %s", report["reported_domain"], MONITORED_DOMAIN)
+    if not _is_primary(report["reported_domain"]):
+        logger.warning("Skipping failure report about %s, not %s", report["reported_domain"], PRIMARY_DOMAIN)
         return
     source = report["source"]
     cur.execute(

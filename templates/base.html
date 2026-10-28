@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>DMARC overview &ndash; {{ domain_status.domain }}</title>
+    <title>DMARC overview &ndash; {{ domain }}</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
     <style>
         :root {
@@ -145,6 +145,12 @@
         .pagination a:hover { border-color: var(--accent); }
         .pagination .disabled { color: var(--muted); opacity: 0.6; }
 
+        nav form { margin: 0; }
+        nav button { display: flex; align-items: center; gap: 0.6rem; width: 100%; padding: 0.55rem 0.75rem;
+                     border: none; border-radius: 7px; background: none; color: var(--text-secondary);
+                     font: inherit; font-size: 0.92rem; cursor: pointer; text-align: left; }
+        nav button:hover { background: var(--surface-2); color: var(--text); }
+
         @media (max-width: 800px) {
             header { padding: 1.25rem 1rem 4rem; }
             .status-wrap { margin: -3rem 1rem 1rem; }
@@ -157,10 +163,11 @@
 </head>
 <body>
     <header>
-        <h1><span aria-hidden="true">🛡️</span> DMARC overview &ndash; {{ domain_status.domain }}</h1>
-        <p class="subtitle">Mail authentication status, reports and mail server security</p>
+        <h1><span aria-hidden="true">🛡️</span> DMARC overview &ndash; {{ domain }}</h1>
+        <p class="subtitle">Mail authentication (SPF, DKIM, DMARC) status and reports</p>
     </header>
 
+    {% block status %}
     <div class="status-wrap">
         <div class="status">
             <h2>Technical (raw DNS data)</h2>
@@ -222,15 +229,26 @@
         </div>
     </div>
 
+    {% endblock %}
+
+    {% block layout %}
     {% set keep_period = {'period': period} if period else {} %}
     <div class="layout">
         <nav>
-            <a href="{{ url_for('index', **keep_period) }}" class="{{ 'active' if active_page == 'data' else '' }}"><span class="icon" aria-hidden="true">📥</span>Received reports</a>
-            <a href="{{ url_for('flagged', **keep_period) }}" class="{{ 'active' if active_page == 'flagged' else '' }}"><span class="icon" aria-hidden="true">🚩</span>Flagged mail</a>
             <a href="{{ url_for('trend') }}" class="{{ 'active' if active_page == 'trend' else '' }}"><span class="icon" aria-hidden="true">📊</span>Volume over time</a>
             <a href="{{ url_for('sources', **keep_period) }}" class="{{ 'active' if active_page == 'sources' else '' }}"><span class="icon" aria-hidden="true">🌐</span>Top sources</a>
+            <a href="{{ url_for('reports', **keep_period) }}" class="{{ 'active' if active_page == 'data' else '' }}"><span class="icon" aria-hidden="true">📥</span>Received reports</a>
+            <a href="{{ url_for('flagged', **keep_period) }}" class="{{ 'active' if active_page == 'flagged' else '' }}"><span class="icon" aria-hidden="true">🚩</span>Flagged mail</a>
+            {% if is_primary_domain %}
             <a href="{{ url_for('tls_reports', **keep_period) }}" class="{{ 'active' if active_page == 'tls' else '' }}"><span class="icon" aria-hidden="true">🔒</span>TLS reports</a>
+            {% else %}
+            <form method="post" action="{{ url_for('logout') }}">
+                <button type="submit"><span class="icon" aria-hidden="true">🚪</span>Log out</button>
+            </form>
+            {% endif %}
+            {% if can_see_security %}
             <a href="{{ url_for('security', **keep_period) }}" class="{{ 'active' if active_page == 'security' else '' }}"><span class="icon" aria-hidden="true">🛡️</span>Mail security</a>
+            {% endif %}
         </nav>
         <main>
             {% if period %}
@@ -244,6 +262,7 @@
             {% block content %}{% endblock %}
         </main>
     </div>
+    {% endblock %}
     {% block extra_body %}{% endblock %}
 </body>
 </html>
