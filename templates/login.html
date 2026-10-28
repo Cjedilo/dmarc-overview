@@ -19,6 +19,7 @@
 
 {% block layout %}
 <form class="login" method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
     <h2>Log in</h2>
     {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
     <label for="password">Password for {{ domain }}</label>

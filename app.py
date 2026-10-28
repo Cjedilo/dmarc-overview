@@ -5,6 +5,7 @@ import ipaddress
 import math
 import os
 import re
+import secrets
 import time
 
 import dns.exception
@@ -74,8 +75,10 @@ MONITORED_DOMAINS = [
     if d.strip()
 ]
 MONITORED_DOMAIN = MONITORED_DOMAINS[0]
-# "voorbeeld.nl=<hash>,ander.nl=<hash>", hashes from scripts/hash_domain_password.py.
-# A domain without a password here can't be opened at all.
+# Initial passwords, "voorbeeld.nl=<hash>,ander.nl=<hash>", hashes from
+# scripts/hash_domain_password.py. Once a password is changed on the Password
+# page, the one in dmarc.domain_passwords wins. A domain with neither can only
+# be opened from our own network.
 DOMAIN_PASSWORDS = {
     domain.strip().lower(): hashed.strip()
     for domain, _, hashed in (
@@ -85,8 +88,8 @@ DOMAIN_PASSWORDS = {
 }
 
 app.secret_key = os.environ.get("SECRET_KEY")
-if DOMAIN_PASSWORDS and not app.secret_key:
-    raise RuntimeError("DOMAIN_PASSWORDS is set, so SECRET_KEY is needed for the login cookie")
+if len(MONITORED_DOMAINS) > 1 and not app.secret_key:
+    raise RuntimeError("More than one domain in MONITORED_DOMAINS, so SECRET_KEY is needed for the login cookie")
 app.config.update(
     # Other apps on appelo.nl may use Flask's default "session" cookie too.
     SESSION_COOKIE_NAME="dmarc_session",
@@ -103,8 +106,9 @@ FIXED_PSEUDONYMS = dict(
     if "=" in pair
 )
 
-# Only these may see the security page (mail server logs); everyone else gets
-# a 404 and no menu link. Comma-separated networks.
+# Our own network: only from here is the security page (mail server logs)
+# visible, and every domain's pages without a password. Everyone else gets a
+# 404 / the login page and no menu links. Comma-separated networks.
 SECURITY_ALLOWED_NETWORKS = [
     ipaddress.ip_network(net.strip())
     for net in os.environ.get(
@@ -136,7 +140,7 @@ def _client_ip():
     return ip
 
 
-def can_see_security():
+def from_own_network():
     ip = _client_ip()
     return ip is not None and any(ip in net for net in SECURITY_ALLOWED_NETWORKS)
 
@@ -464,16 +468,103 @@ def _add_domain(endpoint, values):
         values["domain"] = current_domain()
 
 
+PASSWORDS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS dmarc.domain_passwords (
+    domain TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+_passwords_table_ready = False
+
+
+def _passwords_cursor(conn):
+    global _passwords_table_ready
+    cur = conn.cursor()
+    if not _passwords_table_ready:
+        cur.execute(PASSWORDS_SCHEMA_SQL)
+        _passwords_table_ready = True
+    return cur
+
+
+def get_password_hash(domain):
+    """The domain's current password hash, or None if it can't be logged in to.
+    Looked up per request rather than cached: another gunicorn worker may
+    have just changed it."""
+    if domain not in MONITORED_DOMAINS or domain == MONITORED_DOMAIN:
+        return None
+    cache = g.setdefault("password_hashes", {})
+    if domain not in cache:
+        conn = get_connection()
+        try:
+            with _passwords_cursor(conn) as cur:
+                cur.execute("SELECT password_hash FROM dmarc.domain_passwords WHERE domain = %s", (domain,))
+                row = cur.fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+        cache[domain] = row["password_hash"] if row else DOMAIN_PASSWORDS.get(domain)
+    return cache[domain]
+
+
+def set_password(domain, password):
+    hashed = generate_password_hash(password)
+    conn = get_connection()
+    try:
+        with _passwords_cursor(conn) as cur:
+            cur.execute(
+                """
+                INSERT INTO dmarc.domain_passwords (domain, password_hash) VALUES (%s, %s)
+                ON CONFLICT (domain) DO UPDATE SET password_hash = EXCLUDED.password_hash, changed_at = now()
+                """,
+                (domain, hashed),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    g.setdefault("password_hashes", {})[domain] = hashed
+
+
 def _password_tag(domain):
     # Stored in the (signed, not encrypted) session cookie instead of a plain
     # "logged in" flag, so changing a domain's password logs everyone out.
-    hashed = DOMAIN_PASSWORDS.get(domain) if domain in MONITORED_DOMAINS else None
+    hashed = get_password_hash(domain)
     return hashlib.sha256(hashed.encode()).hexdigest()[:16] if hashed else None
 
 
-def is_unlocked(domain):
+def is_logged_in(domain):
     tag = _password_tag(domain)
     return tag is not None and session.get("unlocked", {}).get(domain) == tag
+
+
+def _remember_login(domain):
+    session.permanent = True
+    session["unlocked"] = {**session.get("unlocked", {}), domain: _password_tag(domain)}
+
+
+def can_open(domain):
+    if domain == MONITORED_DOMAIN:
+        return True
+    if domain in MONITORED_DOMAINS and from_own_network():
+        return True
+    return is_logged_in(domain)
+
+
+@app.before_request
+def _check_csrf():
+    # Our own network gets in on its IP address alone, so without this any
+    # site its users visit could post forms here in their name.
+    if request.method == "POST":
+        token = session.get("csrf")
+        if not token or not secrets.compare_digest(token, request.form.get("csrf", "")):
+            abort(400)
+
+
+@app.template_global()
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_hex(16)
+    return session["csrf"]
 
 
 @app.before_request
@@ -485,7 +576,7 @@ def _check_domain_access():
         abort(404)
     # Unknown domains end up at the login page too, so it doesn't tell which
     # domains are monitored.
-    if not is_unlocked(domain):
+    if not can_open(domain):
         return redirect(url_for("login"))
     return None
 
@@ -493,11 +584,16 @@ def _check_domain_access():
 @app.context_processor
 def inject_periods():
     domain = current_domain()
+    own_network = from_own_network()
     return {
         "periods": PERIODS,
         "domain": domain,
         "is_primary_domain": domain == MONITORED_DOMAIN,
-        "can_see_security": domain == MONITORED_DOMAIN and can_see_security(),
+        "can_see_security": domain == MONITORED_DOMAIN and own_network,
+        "all_domains": MONITORED_DOMAINS if own_network and len(MONITORED_DOMAINS) > 1 else [],
+        # Not via is_logged_in(): that's a database lookup, and this runs for
+        # every page; a stale entry only means a Log out button that does nothing.
+        "logged_in": domain in session.get("unlocked", {}),
     }
 
 
@@ -575,17 +671,16 @@ _DUMMY_PASSWORD_HASH = generate_password_hash("not anyone's password")
 @app.route("/<domain:domain>/login", methods=["GET", "POST"])
 def login():
     domain = g.domain
-    if domain == MONITORED_DOMAIN or is_unlocked(domain):
+    if can_open(domain):
         return redirect(url_for("trend"))
 
     error = None
     if request.method == "POST":
-        hashed = DOMAIN_PASSWORDS.get(domain) if domain in MONITORED_DOMAINS else None
+        hashed = get_password_hash(domain)
         # Unknown domains are checked against a dummy hash, so they take
         # just as long to fail.
         if check_password_hash(hashed or _DUMMY_PASSWORD_HASH, request.form.get("password", "")) and hashed:
-            session.permanent = True
-            session["unlocked"] = {**session.get("unlocked", {}), domain: _password_tag(domain)}
+            _remember_login(domain)
             return redirect(url_for("trend"))
         # Slows down guessing.
         time.sleep(1)
@@ -600,6 +695,55 @@ def logout():
     unlocked.pop(g.domain, None)
     session["unlocked"] = unlocked
     return redirect(url_for("login"))
+
+
+MIN_PASSWORD_LENGTH = 10
+
+
+@app.route("/<domain:domain>/password", methods=["GET", "POST"])
+def password():
+    domain = g.domain
+    if domain == MONITORED_DOMAIN:
+        abort(404)
+    # From our own network a password can be set without knowing the current
+    # one: that's how to give a domain its first password, or reset it.
+    needs_current = not from_own_network()
+
+    error = None
+    if request.method == "POST":
+        current = request.form.get("current", "")
+        new = request.form.get("new", "")
+        if needs_current and not check_password_hash(get_password_hash(domain) or _DUMMY_PASSWORD_HASH, current):
+            time.sleep(1)
+            error = "The current password is wrong."
+        elif len(new) < MIN_PASSWORD_LENGTH:
+            error = f"The new password needs at least {MIN_PASSWORD_LENGTH} characters."
+        elif new != request.form.get("repeat", ""):
+            error = "The new passwords don't match."
+        else:
+            set_password(domain, new)
+            # Everyone else is logged out by the new password; not whoever changed it.
+            if needs_current:
+                _remember_login(domain)
+            return redirect(url_for("password", changed=1))
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            domain_status = get_domain_overview(cur)
+    finally:
+        conn.close()
+
+    return render_template(
+        "password.html",
+        active_page="password",
+        domain_status=domain_status,
+        needs_current=needs_current,
+        has_password=get_password_hash(domain) is not None,
+        min_length=MIN_PASSWORD_LENGTH,
+        error=error,
+        changed=request.args.get("changed") == "1",
+    ), 400 if error else 200
 
 
 # Everything used to live at the root, for our own domain only; keep those
@@ -1070,7 +1214,7 @@ def _add_ip_details(rows):
 
 @app.route("/security")
 def security():
-    if not can_see_security():
+    if not from_own_network():
         abort(404)
     period, since = _period_from_request()
     params = {"since": since}
