@@ -1311,6 +1311,11 @@ def security():
                 SELECT
                     c.source_ip,
                     count(*) AS total,
+                    count(*) FILTER (WHERE d.action = 'reject') AS rejected,
+                    count(*) FILTER (WHERE d.action IN ('add header', 'rewrite subject'))
+                        AS spam,
+                    count(*) FILTER (WHERE d.action IS NULL OR d.action = 'no action')
+                        AS delivered,
                     array_agg(DISTINCT d.domain ORDER BY d.domain) AS domains,
                     min(d.occurred_at) AS first_seen,
                     max(d.occurred_at) AS last_seen

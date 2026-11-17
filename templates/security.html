@@ -15,15 +15,15 @@
             <div class="value">{{ totals.get('rejects_received', 0) }}</div>
         </div>
         <div class="stat {{ 'warn' if totals.get('dmarc_dkim_marked', 0) else 'good' }}">
-            <div class="label">Marked for DMARC/DKIM</div>
+            <div class="label">Failed DMARC</div>
             <div class="value">{{ totals.get('dmarc_dkim_marked', 0) }}</div>
         </div>
     </div>
     <p class="note">From this mail server's own logs (Postfix/Dovecot/rspamd on coador), not DMARC reports.</p>
 
-    <h2 id="marked">Incoming mail marked for DMARC/DKIM, not rejected, by source IP</h2>
+    <h2 id="marked">Incoming mail failing DMARC, by source IP</h2>
     <p class="summary">
-        rspamd only marks DMARC failures (all actions are disabled), so these messages were delivered anyway &ndash; this is who's sending them.
+        rspamd follows the sender's published DMARC policy: <code>p=reject</code> is refused, <code>p=quarantine</code> is delivered marked as spam, <code>p=none</code> is delivered as normal.
     </p>
     <div class="table-wrap">
     <table>
@@ -32,7 +32,10 @@
                 <th>Source IP</th>
                 <th>Country</th>
                 <th>Reverse DNS</th>
-                <th class="num">Marked</th>
+                <th class="num">Failed</th>
+                <th class="num">Rejected</th>
+                <th class="num">Spam</th>
+                <th class="num">Delivered</th>
                 <th>Claimed domain(s)</th>
                 <th>First seen</th>
                 <th>Last seen</th>
@@ -45,13 +48,16 @@
                 <td class="nowrap">{{ r.flag }} {{ r.country or '-' }}</td>
                 <td>{{ r.reverse_dns or '-' }}</td>
                 <td class="num">{{ r.total }}</td>
+                <td class="num">{% if r.rejected %}<span class="badge bad">{{ r.rejected }}</span>{% else %}0{% endif %}</td>
+                <td class="num">{% if r.spam %}<span class="badge warn">{{ r.spam }}</span>{% else %}0{% endif %}</td>
+                <td class="num">{{ r.delivered }}</td>
                 <td>{{ r.domains | join(', ') }}</td>
                 <td class="nowrap">{{ r.first_seen.strftime('%Y-%m-%d %H:%M') }}</td>
                 <td class="nowrap">{{ r.last_seen.strftime('%Y-%m-%d %H:%M') }}</td>
             </tr>
             {% endfor %}
             {% if not dmarc_fail_sources %}
-            <tr><td colspan="7" class="empty">None yet.</td></tr>
+            <tr><td colspan="10" class="empty">None yet.</td></tr>
             {% endif %}
         </tbody>
     </table>

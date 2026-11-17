@@ -22,8 +22,10 @@ Covers six event categories:
     resolve the source IP for a queue-id, joined against DMARC results below
   - rspamd's per-message DMARC verdict (DMARC_* symbols in its task log line,
     /var/log/rspamd/rspamd.log; bas needs to be in group _rspamd to read it).
-    All actions are set to 999 in /etc/rspamd/local.d/actions.conf, so a
-    "fail" here means the message was marked, not rejected.
+    Score-based actions are set to 999 in /etc/rspamd/local.d/actions.conf,
+    but the dmarc module forces the sender's published policy (p=reject ->
+    reject, p=quarantine -> add header), so the action rspamd took is stored
+    alongside the verdict.
 """
 from __future__ import annotations
 
@@ -56,7 +58,7 @@ DB_NAME = os.environ.get("MAILSEC_DB_NAME", "dmarc")
 DB_USER = os.environ.get("MAILSEC_DB_USER", "mailsec")
 DB_PASSWORD = os.environ["MAILSEC_DB_PASSWORD"]
 
-SCHEMA_SQL = """
+SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS mailsec.auth_failures (
     id BIGSERIAL PRIMARY KEY,
     occurred_at TIMESTAMPTZ NOT NULL,
@@ -118,10 +120,16 @@ CREATE TABLE IF NOT EXISTS mailsec.dmarc_results (
     scope TEXT,
     domain TEXT,
     result TEXT,
+    action TEXT,
     raw_line TEXT NOT NULL,
     line_hash TEXT NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS dmarc_results_queue_id_idx ON mailsec.dmarc_results (queue_id);
+ALTER TABLE mailsec.dmarc_results ADD COLUMN IF NOT EXISTS action TEXT;
+-- Rows stored before the action column existed: take it from the raw line.
+UPDATE mailsec.dmarc_results
+    SET action = substring(raw_line FROM '\(\w+: [TFS] \(([^)]+)\): \[')
+    WHERE action IS NULL AND raw_line ~ '\(\w+: [TFS] \([^)]+\): \[';
 """
 
 SYSLOG_TS_RE = re.compile(r"^(?P<ts>\w{3}\s+\d{1,2} \d{2}:\d{2}:\d{2}) \S+ (?P<rest>.*)$")
@@ -150,6 +158,14 @@ CLEANUP_REJECT_RE = re.compile(
     r"(?P<client_host>\S+)\[(?P<client_ip>[0-9a-fA-F.:]+)\]; "
     r".*?: (?P<smtp_code>[\d.]+) \"?(?P<reason>.*?)\"?\s*$"
 )
+# Rejects by a milter (rspamd) at end-of-message, e.g. a forced DMARC p=reject:
+# "postfix/cleanup[123]: 4F2A1220B3C: milter-reject: END-OF-MESSAGE from
+#  host[1.2.3.4]: 5.7.1 Rejected due to DMARC Policy; from=<...> to=<...> proto=ESMTP helo=<...>"
+MILTER_REJECT_RE = re.compile(
+    r"postfix/cleanup\[\d+\]: (?P<queue>\S+): milter-reject: (?P<stage>[\w-]+) from "
+    r"(?P<client_host>\S+)\[(?P<client_ip>[0-9a-fA-F.:]+)\]: "
+    r"(?:(?P<smtp_code>\d{3}) )?(?P<enhanced_code>\d\.\d+\.\d+) (?P<reason>.*?)(?:; from=<|$)"
+)
 MAIL_FROM_RE = re.compile(r"\bfrom=<([^>]*)>")
 RCPT_TO_RE = re.compile(r"\bto=<([^>]*)>")
 HELO_RE = re.compile(r"\bhelo=<?([^>\s]*)>?")
@@ -175,6 +191,9 @@ RSPAMD_TASK_RE = re.compile(
     r".*?\bqid: <(?P<queue>[^>]+)>"
 )
 # Options are "{domain;policy;}" on allow, "{domain : reason;policy;}" on failures.
+# The action taken: "(default: F (no action): [0.23/999.00]" -> "no action",
+# "(default: T (reject): [...]" -> "reject" (also when forced by the dmarc module).
+RSPAMD_ACTION_RE = re.compile(r"\(\w+: [TFS] \((?P<action>[^)]+)\): \[")
 RSPAMD_DMARC_RE = re.compile(r"\bDMARC_(?P<symbol>[A-Z_]+)\([-\d.]+\)\{(?P<options>[^}]*)\}")
 RSPAMD_DMARC_RESULTS = {
     "POLICY_ALLOW": "pass",
@@ -277,6 +296,26 @@ def parse_line(ts: datetime.datetime, rest: str, raw_line: str):
             "line_hash": _line_hash(raw_line),
         }
 
+    m = MILTER_REJECT_RE.search(rest)
+    if m:
+        mail_from = MAIL_FROM_RE.search(rest)
+        rcpt_to = RCPT_TO_RE.search(rest)
+        helo = HELO_RE.search(rest)
+        return "rejects_given", {
+            "occurred_at": ts,
+            "stage": m["stage"],
+            "source_ip": m["client_ip"],
+            "source_host": m["client_host"],
+            "smtp_code": m["smtp_code"],
+            "enhanced_code": m["enhanced_code"],
+            "reason": m["reason"],
+            "mail_from": mail_from.group(1) if mail_from else None,
+            "rcpt_to": rcpt_to.group(1) if rcpt_to else None,
+            "helo": helo.group(1) if helo else None,
+            "raw_line": raw_line,
+            "line_hash": _line_hash(raw_line),
+        }
+
     m = BOUNCED_RE.search(rest)
     if m:
         return "rejects_received", {
@@ -318,6 +357,7 @@ def parse_rspamd_line(raw_line: str):
     with_options = next((s for s in symbols if s["options"]), symbols[0])
     options = [o for o in with_options["options"].split(";") if o]
     domain = options[0].split(" : ")[0].strip() if options else None
+    action = RSPAMD_ACTION_RE.search(raw_line)
     return "dmarc_results", {
         # Naive local time, same as the syslog timestamps.
         "occurred_at": datetime.datetime.strptime(m["ts"], "%Y-%m-%d %H:%M:%S").astimezone(),
@@ -326,6 +366,7 @@ def parse_rspamd_line(raw_line: str):
         "scope": options[1] if len(options) > 1 else None,
         "domain": domain or None,
         "result": "fail" if "fail" in results else results[0],
+        "action": action["action"] if action else None,
         "raw_line": raw_line,
         "line_hash": _line_hash(raw_line),
     }
@@ -409,9 +450,9 @@ INSERT_SQL = {
     """,
     "dmarc_results": """
         INSERT INTO mailsec.dmarc_results
-            (occurred_at, queue_id, component, scope, domain, result, raw_line, line_hash)
+            (occurred_at, queue_id, component, scope, domain, result, action, raw_line, line_hash)
         VALUES (%(occurred_at)s, %(queue_id)s, %(component)s, %(scope)s, %(domain)s,
-                %(result)s, %(raw_line)s, %(line_hash)s)
+                %(result)s, %(action)s, %(raw_line)s, %(line_hash)s)
         ON CONFLICT (line_hash) DO NOTHING
     """,
 }
